@@ -1,0 +1,180 @@
+bootstrapScript: |
+  #!/bin/bash
+  if [ ! -f ~/bootstrap ]; then echo "Running Superset bootstrap" > ~/bootstrap; fi
+configOverrides:
+  audit_event_logger: |
+    # Superset action-audit: ships every logged Superset event (dashboard views,
+    # chart edits, logins, query runs, ...) as a JSON line on Superset's own
+    # stdout, in addition to Superset's normal DBEventLogger (unchanged -- this
+    # is additive, the existing "logs" table in Superset's own Postgres keeps
+    # working exactly as before).
+    #
+    # Printing to stdout (rather than POSTing to Fluent Bit's HTTP input, tried
+    # first) is deliberate: this cluster's fluent-bit build has a confirmed bug
+    # where its `http` input never hands records to any network output
+    # (opensearch, es, even loki) -- see ../fluent-bit/values.yaml for the full
+    # writeup. stdout is already tailed successfully by fluent-bit's existing
+    # `tail` input, the same path every other pod's logs (and Ranger's audit
+    # lines) go through. Fluent Bit picks these lines out of that stream by the
+    # "audit_source":"superset" field below (matched by the
+    # superset_audit_emitter rewrite_tag rule in ../fluent-bit/values.yaml).
+    # Named "audit_source", not "_source" -- the latter is a reserved OpenSearch
+    # metadata field name and documents fail to index if it's reused.
+    #
+    # This file's contents get pasted into configOverrides in the superset helm
+    # values (see ../../README.md "Applying the Trino/Ranger/Superset changes")
+    # -- the chart writes each configOverrides entry into superset_config.py.
+    import json
+    import time
+
+    from superset.utils.log import AbstractEventLogger, DBEventLogger
+
+
+    class JsonStdoutEventLogger(AbstractEventLogger):
+        """Delegates to DBEventLogger (unchanged behavior), then also prints
+        the same event as a single JSON line to stdout for the audit pipeline."""
+
+        def __init__(self):
+            self._db_logger = DBEventLogger()
+
+        def log(self, user_id, action, dashboard_id=None, slice_id=None,
+                duration_ms=None, referrer=None, extra=None, **kwargs):
+            self._db_logger.log(
+                user_id, action, dashboard_id=dashboard_id, slice_id=slice_id,
+                duration_ms=duration_ms, referrer=referrer, extra=extra, **kwargs,
+            )
+            payload = {
+                "audit_source": "superset",
+                "event_time": time.time(),
+                "user_id": user_id,
+                "action": action,
+                "dashboard_id": dashboard_id,
+                "slice_id": slice_id,
+                "duration_ms": duration_ms,
+                "referrer": referrer,
+                "extra": extra,
+            }
+            try:
+                print(json.dumps(payload, default=str), flush=True)
+            except Exception:
+                pass  # audit shipping must never break Superset itself
+
+
+    EVENT_LOGGER = JsonStdoutEventLogger()
+  enable_ldap: |
+    from flask_appbuilder.security.manager import AUTH_LDAP
+
+    AUTH_TYPE = AUTH_LDAP
+    AUTH_USER_REGISTRATION = True
+    AUTH_USER_REGISTRATION_ROLE = "Gamma"
+
+    AUTH_LDAP_SERVER = "ldap://192.168.2.100:3890"
+
+    AUTH_LDAP_SEARCH = "dc=example,dc=com"
+
+    AUTH_LDAP_UID_FIELD = "uid"
+
+    AUTH_LDAP_BIND_USER = "uid=admin,ou=people,dc=example,dc=com"
+    AUTH_LDAP_BIND_PASSWORD = "<REDACTED-set-your-own-ldap-bind-password>"
+
+    AUTH_LDAP_FIRSTNAME_FIELD = "givenName"
+    AUTH_LDAP_LASTNAME_FIELD = "sn"
+    AUTH_LDAP_EMAIL_FIELD = "mail"
+    AUTH_ROLES_MAPPING = {
+        "cn=test,ou=groups,dc=example,dc=com": [
+            "Admin"
+        ],
+        "cn=lldap_admin,ou=groups,dc=example,dc=com": [
+            "Admin"
+        ],
+        "cn=KHCN,ou=groups,dc=example,dc=com": [
+            "KHCN"
+        ],
+        "cn=HN,ou=groups,dc=example,dc=com": [
+            "KHCN", "Region_HN"
+        ],
+        "cn=HCM,ou=groups,dc=example,dc=com": [
+            "KHCN", "Region_HCM"
+        ],
+    }
+
+    AUTH_LDAP_GROUP_FIELD = "memberOf"
+
+    AUTH_ROLES_SYNC_AT_LOGIN = True
+
+    RECAPTCHA_PUBLIC_KEY = None
+    import logging
+
+    logging.basicConfig(level=logging.DEBUG)
+
+    LOG_LEVEL = "DEBUG"
+
+    logging.getLogger("flask_appbuilder").setLevel(logging.DEBUG)
+    logging.getLogger("flask_appbuilder.security").setLevel(logging.DEBUG)
+    logging.getLogger("ldap3").setLevel(logging.DEBUG)
+    logging.getLogger("superset").setLevel(logging.DEBUG)
+extraConfigs: {}
+extraSecretEnv:
+  # REDACTED -- generate your own: `openssl rand -base64 42`
+  SUPERSET_SECRET_KEY: <REDACTED-generate-a-fresh-random-secret>
+hostAliases:
+- hostnames:
+  - trino.local
+  ip: 192.168.2.100
+image:
+  pullPolicy: IfNotPresent
+  repository: docker.io/library/superset-ldap
+  tag: 6.0.0
+ingress:
+  enabled: true
+  hosts:
+  - superset.local
+  ingressClassName: nginx
+  path: /
+  pathType: Prefix
+init:
+  adminUser:
+    email: admin@superset.com
+    firstname: Superset
+    lastname: Admin
+    password: <REDACTED-set-your-own-admin-password>
+    username: admin
+  createAdmin: true
+  enabled: false
+  loadExamples: false
+postgresql:
+  auth:
+    database: superset
+    password: <REDACTED-set-your-own-postgres-password>
+    username: superset
+  enabled: true
+redis:
+  enabled: true
+service:
+  port: 8088
+  type: ClusterIP
+supersetNode:
+  connections:
+    db_host: superset-postgresql
+    db_name: superset
+    db_pass: <REDACTED-must-match-postgresql.auth.password-above>
+    db_port: "5432"
+    db_user: superset
+    redis_host: superset-redis-headless
+    redis_port: "6379"
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+    requests:
+      cpu: 250m
+      memory: 512Mi
+  startupProbe:
+    failureThreshold: 180
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 15
+    periodSeconds: 5
+    successThreshold: 1
+    timeoutSeconds: 1

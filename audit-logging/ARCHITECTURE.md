@@ -209,6 +209,87 @@ ever recording who was allowed or denied access to what. The fix disables
 that dead destination and enables Ranger's log4j destination instead,
 routing through the pipeline above.
 
+## User impersonation: does the audit trail show the real user?
+
+Superset connects to Trino with one fixed base credential rather than a
+per-user one, so without impersonation every dashboard-driven query would
+show up in Ranger/Trino audit as that one shared principal, not the person
+who actually ran it. This cluster's Superset already had `impersonate_user
+= True` set on its Trino connection (Superset natively supports this for
+Trino/Presto), but that only *requests* impersonation -- the Ranger plugin
+still decides whether to allow it, via a real policy check (confirmed by
+decompiling `RangerSystemAccessControl.checkCanImpersonateUser`: it calls
+`hasPermission()` against a Ranger policy before allowing or denying, it's
+not a hardcoded stub). Ranger's default install already ships a catch-all
+policy granting `impersonate` to `ranger` and to `{USER}` (a macro meaning
+"yourself only") -- it did **not** grant it to Superset's actual connecting
+principal, so every impersonation attempt was being silently rejected and
+Trino/Ranger audit would have kept showing the shared account regardless
+of how many real users interacted with dashboards. `ranger/
+setup-impersonation.sh` adds that principal to the existing policy (Ranger
+rejects a second policy matching the same resource, so it edits in place
+rather than creating a competing one).
+
+Verified end-to-end 2026-09-23, not just at the policy level: ran a real
+query through Superset's own Trino connection with the session user forced
+to a real LDAP-backed account (`alice`), confirmed Trino's own
+`current_user` returned `alice` (not the base connection principal), and
+confirmed the resulting audit records in both `ranger_audits-*`
+(`reqUser`) and `trino_query_audit-*` (`context.user`) in OpenSearch
+correctly show `alice`, with full per-column authorization detail.
+
+## Bugs found and fixed during rollout
+
+Three real, concrete bugs were found while verifying the pipeline against
+*real* traffic (queries actually executed through Trino/Superset) rather
+than the synthetic test payloads used during initial development. All
+three were silent -- no errors anywhere, data just never arrived.
+
+**1. Trino query-audit matched the wrong field path.** The original
+`rewrite_tag` rule matched a top-level `$queryId` field, based on a
+synthetic test payload shaped like `{"queryId": "...", ...}`. Trino's real
+`http-event-listener` payload nests it as `metadata.queryId` (with a
+top-level `context` object holding the actual user identity, and a
+top-level `metadata` object holding query details) -- the rule silently
+matched nothing, ever, for real events. Fixed by matching
+`$metadata['queryId']` instead. This means the entire Trino query-audit
+pipeline had never actually captured a single real query before this fix,
+despite passing every synthetic test during original development.
+
+**2. Ranger's async audit queue needed an explicit flush interval.**
+`xasecure.audit.log4j.is.async=true` with only
+`xasecure.audit.log4j.async.max.queue.size=10240` set means the queue only
+flushes when full (10,240 events) or on JVM shutdown. At this cluster's
+audit volume, that's effectively "never" -- events for real, successful,
+correctly-authorized queries sat buffered indefinitely and never appeared
+in stdout, even though the log4j destination itself initialized without
+any error. Fixed by adding
+`xasecure.audit.log4j.async.max.flush.interval.ms=1000`.
+
+**3. Ranger's audit JSON isn't a bare JSON line.** Once (1) and (2) were
+both fixed, the audit JSON *did* start appearing in Trino's stdout -- but
+prefixed with Trino/Airlift's own tab-separated log format
+(`timestamp\tLEVEL\tthread\tlogger-name\t<json>`), not as a standalone
+JSON line. The `kubernetes` filter's `Merge_Log` requires the *entire* log
+line to be valid JSON to parse it; given the prefix, it silently fails to
+parse, so `repoType` (or any Ranger field) never becomes a real merged
+field -- it stays buried inside the raw, unparsed `log` string. Fixed with
+two changes: the `rewrite_tag` rule now matches raw `$log` text containing
+`repoType` instead of a merged field, and two additional `[FILTER] parser`
+stages (a custom regex parser to extract the trailing JSON substring, then
+a JSON parser to decode it) pull the real fields back out before the
+record reaches OpenSearch -- see `fluent-bit/values.yaml`'s `customParsers`
+block and the `RANGER AUDIT SHAPE` comment near the top of that file.
+Without this, every Ranger audit document in OpenSearch would just be one
+large unsearchable raw-text blob instead of real, per-field-queryable data.
+
+Each of these was found by generating a real, successful, authorized query
+and checking whether it actually showed up end-to-end -- not by re-reading
+the config. If this pipeline is ever modified again, that's the standard
+to re-verify against: a synthetic test payload matching your own
+assumptions about the schema proves nothing about whether the real
+upstream service's actual output matches those assumptions.
+
 ## Retention model
 
 | Tier | Store | Duration | Mechanism |

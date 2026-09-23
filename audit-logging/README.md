@@ -9,14 +9,19 @@ design and the reasoning behind each choice; this file is the
 install/operate guide.
 
 **Status as of 2026-09-23: fully deployed and verified end-to-end on this
-cluster** -- real events (not just synthetic markers) for all three
-sources confirmed flowing all the way through: OpenSearch indices, MinIO
-raw landing files, and Iceberg tables in the `lakehouse` warehouse (schema,
-Parquet data files, and Nessie catalog registration all inspected
-directly). One thing is *not* fully verified: the exact shape of Ranger's
-real audit-log lines in production (only tested against a synthetic
-marker, since getting a real query through Trino's auth wasn't done during
-this rollout) -- see "Verifying the Ranger audit filter" below.
+cluster with real, impersonated queries** (not just synthetic markers) --
+confirmed flowing correctly through every stage: OpenSearch indices (with
+the real end user, not a shared service account -- see "Does it show the
+real user" below), MinIO raw landing files, and Iceberg tables in the
+`lakehouse` warehouse (schema, Parquet data files, and Nessie catalog
+registration all inspected directly), plus 12+ consecutive successful
+hourly Spark archival runs across all three sources. Three real bugs were
+found and fixed along the way (not just theoretical caveats) -- see
+`ARCHITECTURE.md` "Bugs found and fixed during rollout" for the full
+writeup: Trino's query-audit field is nested (`metadata.queryId`, not
+top-level), Ranger's async audit queue needed an explicit flush interval,
+and Ranger's audit JSON is embedded in Trino's tab-separated log format
+rather than being a bare JSON line.
 
 ## What's here
 
@@ -33,9 +38,13 @@ spark/         The periodic Spark job that loads raw JSON into Iceberg
                tables under the `lakehouse` warehouse. This is the actual
                cold, queryable archive.
 ism-policies/  Per-source hot(30d)->delete lifecycle policies for OpenSearch.
-ranger/        Fixes Ranger's audit destination (was silently broken).
+ranger/        Fixes Ranger's audit destination (was silently broken) and
+               grants the real-user-impersonation policy Superset needs.
 trino/         Query-audit event listener + the shim it needs (see below).
 superset/      Action-audit event logger (pastes into superset_config.py).
+install-guide/ Pulled Helm chart archives + the exact values used, for
+               reproducing these releases without a chart-repo lookup --
+               includes offline/air-gapped install notes.
 ```
 
 ## Architecture in one paragraph
@@ -172,6 +181,22 @@ helm upgrade superset superset/superset -n default -f /tmp/superset-values.yaml
 kubectl rollout restart deployment/superset deployment/superset-worker -n default
 ```
 
+**If Superset's Trino connection has "Impersonate the logged in user"
+enabled** (check: Data > Databases > Trino > Edit > Advanced > Security in
+the Superset UI, or `d.impersonate_user` on the `Database` row via
+`superset shell`) -- it does on this cluster -- Ranger needs to explicitly
+authorize whichever principal Superset actually connects as to impersonate
+other users, or every impersonated query fails outright:
+
+```bash
+RANGER_ADMIN_USER=admin RANGER_ADMIN_PASSWORD=<...> \
+IMPERSONATOR=<the base user in Superset's Trino connection string> \
+  ./ranger/setup-impersonation.sh
+```
+
+See "Does it show the real user, or the shared service account?" below for
+why this specific step is needed and how it was verified.
+
 ### 7. Spark archival job (cold tier -> Iceberg)
 
 Requires `spark-operator` (already installed on this cluster; if its
@@ -246,30 +271,28 @@ kubectl run mc --restart=Never -n default --image=quay.io/minio/mc:latest --comm
 For Ranger, provoke any Trino query as a Ranger-authenticated user and
 check `ranger_audits-*` the same way.
 
-## Verifying the Ranger audit filter
+## Does it show the real user, or the shared service account?
 
-The `rewrite_tag` rule that picks Ranger's audit lines out of Trino's
-stdout (`fluent-bit/values.yaml`, matches on a `repoType` field) was tested
-against a *synthetic* JSON line, not Ranger's real log4j output -- I did
-not get a real query through Trino's auth during this rollout. Ranger's
-audit schema has used `repoType` as a stable top-level field for years, so
-this is a reasonable default, but before relying on it:
+**Yes, for both Ranger and Trino query audit** -- verified end-to-end with
+real impersonated queries on 2026-09-23, not just synthetic tests. Superset
+connects to Trino with one fixed base credential (`admin`), but its Trino
+connection has `impersonate_user = True` set, and Trino's Ranger plugin
+genuinely enforces per-user impersonation via a real policy check (not a
+hardcoded allow/deny) -- confirmed by decompiling the plugin's
+`checkCanImpersonateUser`. That policy (Ranger's default `all - trinouser`
+policy, resource type `trinouser`, access type `impersonate`) only granted
+`ranger` and `{USER}` (self-impersonation) by default; `superset` needed to
+be added, which required first registering `superset` as a Ranger user
+(Ranger has no user until you've done that explicitly). Once granted,
+`SELECT current_user` through a Superset-impersonated session correctly
+returns the real end user, and that same real user shows up correctly in
+both `ranger_audits-*` (`reqUser`) and `trino_query_audit-*`
+(`context.user`) in OpenSearch, with real per-column authorization detail.
 
-```bash
-kubectl logs -l app.kubernetes.io/component=coordinator -n default | grep -i xaaudit
-```
-
-Look at an actual audit line's shape. If Ranger's log4j appender prefixes
-the JSON with a timestamp/log-level (common log4j behavior), `Merge_Log`
-in the `kubernetes` filter will fail to parse it as JSON, and `repoType`
-won't exist as a top-level field (Merge_Log only merges JSON that occupies
-the *entire* log line, and drops the raw `log` field either way per
-`Keep_Log Off`). If that's the case, either:
-- adjust `xasecure.audit.log4j` settings / the underlying logger's pattern
-  to emit bare JSON with no prefix, or
-- change the rewrite_tag rule to match against whatever raw text pattern
-  the real line actually has, keeping `Keep_Log On` in the kubernetes
-  filter so the raw `$log` field survives for regex matching.
+If you rotate/replace Superset's Trino connection or its base credential,
+re-check that the new principal has this same `impersonate` grant, or
+audit trails will silently revert to showing the shared account for every
+dashboard-driven query.
 
 ## Retention
 
@@ -287,7 +310,6 @@ the *entire* log line, and drops the raw `log` field either way per
 
 ## Known gaps / follow-ups
 
-- Ranger audit filter needs verification against real output (above).
 - OpenSearch uses the image's auto-generated demo TLS certs (self-signed,
   cluster-internal only). Fine for this single-node, internal-only setup;
   replace before ever exposing OpenSearch outside the cluster.

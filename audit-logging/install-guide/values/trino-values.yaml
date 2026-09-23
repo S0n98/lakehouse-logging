@@ -1,0 +1,243 @@
+accessControl:
+  properties: |
+    access-control.name=ranger
+    ranger.service.name=trino
+    ranger.plugin.config.resource=/etc/trino/ranger-trino-security.xml,/etc/trino/ranger-trino-audit.xml
+  type: properties
+additionalConfigProperties:
+# REDACTED for this guide -- generate your own: `openssl rand -base64 32`
+- internal-communication.shared-secret=<REDACTED-generate-a-fresh-random-secret>
+auth:
+  # REDACTED -- these are bcrypt hashes of this cluster's actual "ranger" and
+  # "superset" trino user passwords. Generate your own with, e.g.:
+  #   htpasswd -bnBC 10 "" '<password>' | tr -d ':\n'
+  passwordAuth: |
+    ranger:<REDACTED-bcrypt-hash>
+    superset:<REDACTED-bcrypt-hash>
+catalogs:
+  iceberg: |
+    connector.name=iceberg
+    iceberg.catalog.type=rest
+    iceberg.rest-catalog.uri=http://nessie.default.svc.cluster.local:19120/iceberg
+    iceberg.rest-catalog.warehouse=lakehouse
+    iceberg.rest-catalog.security=NONE
+    fs.native-s3.enabled=true
+    s3.endpoint=http://myminio-hl.default.svc.cluster.local:9000
+    s3.region=us-east-1
+    s3.aws-access-key=<REDACTED-minio-access-key>
+    s3.aws-secret-key=<REDACTED-minio-secret-key>
+    s3.path-style-access=true
+  tpcds: |
+    connector.name=tpcds
+    tpcds.splits-per-node=4
+  tpch: |
+    connector.name=tpch
+    tpch.splits-per-node=4
+coordinator:
+  additionalConfigFiles:
+    event-listener.properties: |
+      # Trino query audit: emits QueryCreated/QueryCompleted events as JSON over
+      # HTTP POST. Points at the audit-shim (see ./audit-shim.yaml), NOT directly
+      # at fluent-bit -- this cluster's fluent-bit build has a confirmed bug where
+      # its `http` input never hands records to any network output (opensearch,
+      # es, even loki). The shim just prints the POST body to its own stdout,
+      # which fluent-bit already tails successfully via the existing `tail` input.
+      # Fluent Bit picks Trino's lines out of that stream by the presence of the
+      # "queryId" field, which every http-event-listener payload has (see the
+      # trino_audit_emitter rewrite_tag rule in ../fluent-bit/values.yaml).
+      # Goes on the coordinator only (event-listener.name=http is a coordinator-only
+      # plugin). Referenced via coordinator.additionalConfigFiles in the trino helm
+      # values (see ../../README.md "Applying the Trino/Ranger/Superset changes").
+      event-listener.name=http
+      http-event-listener.log-created=true
+      http-event-listener.log-completed=true
+      http-event-listener.connect-ingest-uri=http://trino-audit-shim.monitoring.svc.cluster.local:8080/
+      http-event-listener.connect-retry-count=3
+      http-event-listener.connect-retry-delay=1s
+    file-authenticator.properties: |
+      password-authenticator.name=file
+      file.password-file=/etc/trino/auth/password/password.db
+    password-authenticator.properties: |
+      password-authenticator.name=ldap
+      ldap.url=ldap://192.168.2.100:3890
+      ldap.allow-insecure=true
+      ldap.user-bind-pattern=uid=${USER},ou=people,dc=example,dc=com
+    ranger-trino-audit.xml: |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!--
+        Replaces the previous ranger-trino-audit.xml, which pointed at
+        http://ranger-solr:6083/solr/ranger_audits, a service that does not exist
+        in this cluster, so every Ranger access-audit event was silently being
+        dropped (confirmed: no "solr" service/configmap anywhere in the cluster).
+
+        This version disables the dead Solr destination and enables the log4j
+        destination instead: audit events get logged as JSON lines to the Trino
+        coordinator/worker's own stdout, where they are already being tailed by
+        Fluent Bit (kube.* input); a rewrite_tag filter skims them back out into
+        the audit.ranger.trino stream -> OpenSearch ranger_audits-*.
+        See ../fluent-bit/values.yaml for that filter and the caveat about
+        verifying its regex against real output.
+      -->
+      <configuration>
+        <property>
+          <name>xasecure.audit.is.enabled</name>
+          <value>true</value>
+        </property>
+        <property>
+          <name>xasecure.audit.solr.is.enabled</name>
+          <value>false</value>
+        </property>
+        <property>
+          <name>xasecure.audit.log4j.is.enabled</name>
+          <value>true</value>
+        </property>
+        <property>
+          <name>xasecure.audit.log4j.is.async</name>
+          <value>true</value>
+        </property>
+        <property>
+          <name>xasecure.audit.log4j.async.max.queue.size</name>
+          <value>10240</value>
+        </property>
+      </configuration>
+    ranger-trino-security.xml: |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <configuration>
+        <property>
+          <name>ranger.plugin.trino.policy.rest.url</name>
+          <value>http://ranger-apache-ranger.ranger:6080</value>
+        </property>
+        <property>
+          <name>ranger.plugin.trino.service.name</name>
+          <value>trino</value>
+        </property>
+        <property>
+          <name>ranger.plugin.trino.policy.cache.dir</name>
+          <value>/tmp/ranger/trino/policy-cache</value>
+        </property>
+        <property>
+          <name>ranger.plugin.trino.policy.pollIntervalMs</name>
+          <value>30000</value>
+        </property>
+      </configuration>
+  resources:
+    limits:
+      cpu: 2000m
+      memory: 4Gi
+    requests:
+      cpu: 500m
+      memory: 2Gi
+image:
+  pullPolicy: IfNotPresent
+  repository: trinodb/trino
+  tag: ""
+ingress:
+  annotations: {}
+  className: nginx
+  enabled: true
+  hosts:
+  - host: trino.local
+    paths:
+    - path: /
+      pathType: Prefix
+  tls:
+  - hosts:
+    - trino.local
+    secretName: trino-tls
+server:
+  config:
+    authenticationType: PASSWORD
+    http:
+      port: 8080
+    path: /etc/trino
+    query:
+      maxMemory: 2GB
+      maxMemoryPerNode: 1GB
+  coordinatorExtraConfig: |
+    http-server.process-forwarded=true
+    http-server.authentication.allow-insecure-over-http=true
+    password-authenticator.config-files=/etc/trino/password-authenticator.properties,/etc/trino/file-authenticator.properties
+  jvm:
+    gcMethod:
+      g1:
+        heapRegionSize: 32M
+      type: UseG1GC
+    maxHeapSize: 2G
+  log:
+    trino:
+      level: INFO
+  node:
+    dataDir: /data/trino
+    environment: production
+    pluginDir: /usr/lib/trino/plugin
+  workerExtraConfig: ""
+  workers: 1
+service:
+  type: ClusterIP
+worker:
+  additionalConfigFiles:
+    ranger-trino-audit.xml: |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!--
+        Replaces the previous ranger-trino-audit.xml, which pointed at
+        http://ranger-solr:6083/solr/ranger_audits, a service that does not exist
+        in this cluster, so every Ranger access-audit event was silently being
+        dropped (confirmed: no "solr" service/configmap anywhere in the cluster).
+
+        This version disables the dead Solr destination and enables the log4j
+        destination instead: audit events get logged as JSON lines to the Trino
+        coordinator/worker's own stdout, where they are already being tailed by
+        Fluent Bit (kube.* input); a rewrite_tag filter skims them back out into
+        the audit.ranger.trino stream -> OpenSearch ranger_audits-*.
+        See ../fluent-bit/values.yaml for that filter and the caveat about
+        verifying its regex against real output.
+      -->
+      <configuration>
+        <property>
+          <name>xasecure.audit.is.enabled</name>
+          <value>true</value>
+        </property>
+        <property>
+          <name>xasecure.audit.solr.is.enabled</name>
+          <value>false</value>
+        </property>
+        <property>
+          <name>xasecure.audit.log4j.is.enabled</name>
+          <value>true</value>
+        </property>
+        <property>
+          <name>xasecure.audit.log4j.is.async</name>
+          <value>true</value>
+        </property>
+        <property>
+          <name>xasecure.audit.log4j.async.max.queue.size</name>
+          <value>10240</value>
+        </property>
+      </configuration>
+    ranger-trino-security.xml: |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <configuration>
+        <property>
+          <name>ranger.plugin.trino.policy.rest.url</name>
+          <value>http://ranger-apache-ranger.ranger:6080</value>
+        </property>
+        <property>
+          <name>ranger.plugin.trino.service.name</name>
+          <value>trino</value>
+        </property>
+        <property>
+          <name>ranger.plugin.trino.policy.cache.dir</name>
+          <value>/tmp/ranger/trino/policy-cache</value>
+        </property>
+        <property>
+          <name>ranger.plugin.trino.policy.pollIntervalMs</name>
+          <value>30000</value>
+        </property>
+      </configuration>
+  resources:
+    limits:
+      cpu: 2000m
+      memory: 4Gi
+    requests:
+      cpu: 500m
+      memory: 2Gi

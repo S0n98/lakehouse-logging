@@ -34,4 +34,15 @@
     <name>xasecure.audit.log4j.async.max.queue.size</name>
     <value>10240</value>
   </property>
+  <property>
+    <!-- Without this, the async queue (sized 10240 above) only flushes when
+         full or on JVM shutdown, meaning at this cluster's low audit volume
+         events could sit buffered indefinitely and never appear in stdout.
+         Confirmed missing during rollout verification: the log4j destination
+         initialized correctly (xaaudit.org.apache.ranger.audit.provider.
+         Log4jAuditProvider logger enabled in log.properties) but produced
+         zero audit records for real, successful queries without this. -->
+    <name>xasecure.audit.log4j.async.max.flush.interval.ms</name>
+    <value>1000</value>
+  </property>
 </configuration>
