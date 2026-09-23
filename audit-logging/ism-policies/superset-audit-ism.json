@@ -1,0 +1,23 @@
+{
+  "policy": {
+    "description": "Superset action-audit: hot for 30d in OpenSearch, then delete. The durable cold copy is independent -- the raw event is also landed in MinIO (fluent-bit's s3 output) and loaded into an Iceberg table by a periodic Spark job (see ../spark/), so no OpenSearch snapshot is needed here.",
+    "default_state": "hot",
+    "states": [
+      {
+        "name": "hot",
+        "actions": [],
+        "transitions": [
+          { "state_name": "delete", "conditions": { "min_index_age": "30d" } }
+        ]
+      },
+      {
+        "name": "delete",
+        "actions": [ { "delete": {} } ],
+        "transitions": []
+      }
+    ],
+    "ism_template": [
+      { "index_patterns": ["superset_audit-*"], "priority": 100 }
+    ]
+  }
+}

@@ -1,0 +1,223 @@
+# Helm values for fluent/fluent-bit (release "fluent-bit" in ns monitoring).
+# This is the FULL merged values for the release -- it includes everything
+# already in production (generic kube.* -> Loki tailing) PLUS the new audit
+# routing added for the hot/cold audit-log pipeline. Apply with:
+#
+#   helm upgrade fluent-bit fluent/fluent-bit -n monitoring -f values.yaml
+#
+# ARCHITECTURE NOTE -- read before changing this file:
+# This cluster's fluent-bit build (cr.fluentbit.io/fluent/fluent-bit:5.0.9,
+# and confirmed also on 3.1.9) has a reproducible bug: its `http` input type
+# NEVER successfully hands a record to any network-based output (opensearch,
+# es, and even loki all confirmed affected) -- the request is accepted
+# (HTTP 201, input record counters increment) but the engine logs
+# "task ... without routes, dropping" and the record vanishes, with zero
+# errors anywhere. This reproduces even in the simplest possible config: one
+# `http` input, one `opensearch` output, direct tag match, no filters. Local
+# outputs (stdout, null) are unaffected. Root-caused via isolated repros
+# outside this chart on 2026-09-23; do not reintroduce an `http` input for
+# audit ingestion without re-testing this on whatever fluent-bit version is
+# running at the time -- it may have been fixed upstream.
+#
+# Given that, every audit source reaches OpenSearch via the pipeline that
+# IS proven to work end-to-end: the existing `tail` input (already reading
+# every pod's container logs for Loki) -> `kubernetes` filter -> a
+# `rewrite_tag` filter per source, keyed on a field unique to that source's
+# JSON payload -> a dedicated `opensearch` output per resulting tag.
+#   - Ranger access-audit: Trino's Ranger plugin logs audit JSON to its own
+#     stdout once the log4j destination is enabled (see
+#     ../ranger/ranger-trino-audit.xml). Matched on the "repoType" field.
+#   - Trino query-audit: Trino's http-event-listener plugin can only POST
+#     over HTTP, so it posts to ../trino/audit-shim.yaml, a tiny sidecar
+#     service in this namespace that just prints the POST body to ITS OWN
+#     stdout -- landing it in the same already-working tail stream. Matched
+#     on the "queryId" field (present on every http-event-listener payload).
+#   - Superset action-audit: Superset's custom EVENT_LOGGER (see
+#     ../superset/event-logger.py) prints straight to Superset's own stdout
+#     -- no network hop needed at all. Matched on "audit_source":"superset"
+#     (named to avoid "_source", which is a reserved OpenSearch metadata
+#     field name and fails to index if used as a real document field).
+#
+# CAVEAT: the ranger rewrite_tag Rule field ("repoType") is Ranger's
+# documented, stable audit-record field name, but it has NOT yet been
+# verified against this exact plugin build's real log4j output on this
+# cluster (only tested against a synthetic marker line). After enabling the
+# Ranger log4j audit destination, check `kubectl logs` on a trino coordinator
+# pod for the actual audit line shape and adjust this rule if needed -- see
+# ../README.md "Verifying the Ranger audit filter".
+
+config:
+  filters: |
+    [FILTER]
+        Name                kubernetes
+        Match               kube.*
+        Merge_Log           On
+        Keep_Log            Off
+        K8S-Logging.Parser  On
+        K8S-Logging.Exclude On
+
+    [FILTER]
+        Name          rewrite_tag
+        Match         kube.*
+        Rule          $repoType ^.*$ audit.ranger.trino true
+        Emitter_Name  ranger_audit_emitter
+
+    [FILTER]
+        Name          rewrite_tag
+        Match         kube.*
+        Rule          $queryId ^.*$ audit.trino true
+        Emitter_Name  trino_audit_emitter
+
+    [FILTER]
+        Name          rewrite_tag
+        Match         kube.*
+        Rule          $audit_source ^superset$ audit.superset true
+        Emitter_Name  superset_audit_emitter
+
+  inputs: |
+    [INPUT]
+        Name              tail
+        Path              /var/log/containers/*.log
+        multiline.parser  docker, cri
+        Tag               kube.*
+        Mem_Buf_Limit     10MB
+        Skip_Long_Lines   On
+
+  outputs: |
+    [OUTPUT]
+        Name        loki
+        Match       kube.*
+        Host        loki.monitoring.svc.cluster.local
+        Port        3100
+        Labels      job=fluentbit
+        Label_keys  $kubernetes['namespace_name'],$kubernetes['pod_name'],$kubernetes['labels']['app'],$kubernetes['labels']['spark-role'],$kubernetes['labels']['component']
+        Auto_Kubernetes_Labels Off
+
+    [OUTPUT]
+        Name                 opensearch
+        Match                audit.ranger.*
+        Host                 opensearch-cluster-master.logging.svc.cluster.local
+        Port                 9200
+        HTTP_User            admin
+        HTTP_Passwd          ${OPENSEARCH_ADMIN_PASSWORD}
+        tls                  On
+        tls.verify           Off
+        Suppress_Type_Name   On
+        Logstash_Format      On
+        Logstash_Prefix      ranger_audits
+        Logstash_DateFormat  %Y.%m.%d
+        Trace_Error          On
+        Retry_Limit          5
+
+    [OUTPUT]
+        Name                 opensearch
+        Match                audit.trino
+        Host                 opensearch-cluster-master.logging.svc.cluster.local
+        Port                 9200
+        HTTP_User            admin
+        HTTP_Passwd          ${OPENSEARCH_ADMIN_PASSWORD}
+        tls                  On
+        tls.verify           Off
+        Suppress_Type_Name   On
+        Logstash_Format      On
+        Logstash_Prefix      trino_query_audit
+        Logstash_DateFormat  %Y.%m.%d
+        Trace_Error          On
+        Retry_Limit          5
+
+    [OUTPUT]
+        Name                 opensearch
+        Match                audit.superset
+        Host                 opensearch-cluster-master.logging.svc.cluster.local
+        Port                 9200
+        HTTP_User            admin
+        HTTP_Passwd          ${OPENSEARCH_ADMIN_PASSWORD}
+        tls                  On
+        tls.verify           Off
+        Suppress_Type_Name   On
+        Logstash_Format      On
+        Logstash_Prefix      superset_audit
+        Logstash_DateFormat  %Y.%m.%d
+        Trace_Error          On
+        Retry_Limit          5
+
+    # Cold tier: raw NDJSON landing in MinIO, one prefix per source. A
+    # periodic Spark job (../spark/) reads these and loads them into real
+    # Iceberg tables under the existing `lakehouse` warehouse/Nessie catalog
+    # -- queryable from Trino, unlike an OpenSearch snapshot. These three
+    # outputs match the SAME tags as the opensearch outputs above (proven
+    # safe: multiple outputs matching one tag works fine for tail-sourced
+    # records -- verified 2026-09-23; this is a DIFFERENT code path than the
+    # http-input bug documented above, which was about the INPUT side).
+    # Raw files are never deleted/moved by the Spark job -- they sit here,
+    # in the Object-Lock-protected bucket, as the immutable original copy.
+    [OUTPUT]
+        Name                 s3
+        Match                audit.ranger.*
+        bucket               audit-logs-cold
+        endpoint             http://myminio-hl.default.svc.cluster.local:9000
+        region               us-east-1
+        s3_key_format        /raw/ranger/%Y/%m/%d/%H/$UUID.json
+        use_put_object       On
+        total_file_size      1M
+        upload_timeout       1m
+
+    [OUTPUT]
+        Name                 s3
+        Match                audit.trino
+        bucket               audit-logs-cold
+        endpoint             http://myminio-hl.default.svc.cluster.local:9000
+        region               us-east-1
+        s3_key_format        /raw/trino/%Y/%m/%d/%H/$UUID.json
+        use_put_object       On
+        total_file_size      1M
+        upload_timeout       1m
+
+    [OUTPUT]
+        Name                 s3
+        Match                audit.superset
+        bucket               audit-logs-cold
+        endpoint             http://myminio-hl.default.svc.cluster.local:9000
+        region               us-east-1
+        s3_key_format        /raw/superset/%Y/%m/%d/%H/$UUID.json
+        use_put_object       On
+        total_file_size      1M
+        upload_timeout       1m
+
+  service: |
+    [SERVICE]
+        Flush         5
+        Log_Level     info
+        Parsers_File  parsers.conf
+        HTTP_Server   On
+        HTTP_Listen   0.0.0.0
+        HTTP_Port     2020
+        Health_Check  On
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+
+tolerations:
+- operator: Exists
+
+env:
+  - name: OPENSEARCH_ADMIN_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: opensearch-admin-password
+        key: OPENSEARCH_ADMIN_PASSWORD
+  # Used by the `s3` outputs above (standard AWS credential chain) --
+  # secret is a copy of the `minio-credentials` secret from the default
+  # namespace (secrets don't cross namespaces).
+  - name: AWS_ACCESS_KEY_ID
+    valueFrom:
+      secretKeyRef:
+        name: minio-credentials
+        key: awsAccessKeyId
+  - name: AWS_SECRET_ACCESS_KEY
+    valueFrom:
+      secretKeyRef:
+        name: minio-credentials
+        key: awsSecretAccessKey

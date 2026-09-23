@@ -1,0 +1,87 @@
+# Helm values for opensearch-project/helm-charts :: opensearch
+# Single-node OpenSearch (this cluster has one physical k8s node), used as the
+# HOT / searchable tier for audit logs (Ranger, Trino, Superset).
+#
+# Install:
+#   helm repo add opensearch https://opensearch-project.github.io/helm-charts
+#   helm repo update
+#   kubectl create namespace logging
+#   kubectl create secret generic opensearch-admin-password -n logging \
+#     --from-literal=OPENSEARCH_INITIAL_ADMIN_PASSWORD='<strong-password>'
+#   helm install opensearch opensearch/opensearch -n logging -f values.yaml
+
+clusterName: opensearch-cluster
+nodeGroup: master
+
+# Single physical node in this k8s cluster -> single OpenSearch node, single-node
+# discovery (no split-brain/quorum concerns, no HA to gain here).
+singleNode: true
+replicas: 1
+
+image:
+  # Custom image = opensearchproject/opensearch:2.19.1 + the repository-s3
+  # plugin (needed to snapshot indices straight to the MinIO cold bucket).
+  # Built from Dockerfile.opensearch-s3 via build-and-import-image.sh,
+  # and imported directly into this node's containerd k8s.io namespace --
+  # not pushed to any registry, so imagePullPolicy must stay IfNotPresent.
+  repository: opensearch-with-s3
+  tag: "2.19.1"
+  pullPolicy: IfNotPresent
+
+resources:
+  requests:
+    cpu: "1"
+    memory: "3Gi"
+  limits:
+    cpu: "2"
+    memory: "4Gi"
+
+# Keep JVM heap well under container memory limit (rule of thumb: ~50%).
+opensearchJavaOpts: "-Xms1536m -Xmx1536m"
+
+# OPENSEARCH_INITIAL_ADMIN_PASSWORD is required by OpenSearch >=2.12 (no more
+# default admin/admin) -- sourced from the pre-created secret, never inlined.
+extraEnvs:
+  - name: OPENSEARCH_INITIAL_ADMIN_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: opensearch-admin-password
+        key: OPENSEARCH_INITIAL_ADMIN_PASSWORD
+
+persistence:
+  enabled: true
+  storageClass: nfs-client
+  size: 100Gi
+
+# Seeds the S3 client credentials into the OpenSearch keystore at startup,
+# using the chart's native keystore mechanism: each key in the referenced
+# secret becomes a keystore entry of the same name.
+# Secret created by: kubectl create secret generic minio-s3-keystore-creds ...
+# (see ../README section "OpenSearch <-> MinIO snapshot repo").
+keystore:
+  - secretName: minio-s3-keystore-creds
+
+config:
+  # Deliberately do NOT set any plugins.security.ssl.* paths here: leaving
+  # them unset is what lets the image's own entrypoint
+  # (install_demo_configuration.sh) detect that security isn't configured
+  # yet, generate the demo certs, and append the SSL block itself. Setting
+  # them ourselves (tried first) makes the installer think it's already
+  # configured, skip cert generation, and crash on missing cert files -- this
+  # is a single-node store reachable only inside the cluster, so the
+  # auto-generated demo certs are an acceptable tradeoff here. If this
+  # OpenSearch is ever exposed beyond the cluster, replace them with real
+  # certs via securityConfig / a cert secret before that happens.
+  opensearch.yml: |
+    cluster.name: opensearch-cluster
+    network.host: 0.0.0.0
+    discovery.type: single-node
+
+    s3.client.default.endpoint: myminio-hl.default.svc.cluster.local:9000
+    s3.client.default.protocol: http
+    s3.client.default.path_style_access: true
+    s3.client.default.region: us-east-1
+
+service:
+  type: ClusterIP
+  httpPortName: http

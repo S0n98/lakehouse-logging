@@ -1,0 +1,88 @@
+# Trino's http-event-listener plugin only knows how to POST JSON over HTTP --
+# it cannot log to stdout directly. But this cluster's fluent-bit build has a
+# confirmed bug where its `http` input never successfully hands records to
+# any network-based output (opensearch, es, even loki) -- see
+# ../fluent-bit/values.yaml for the full writeup. Workaround: this tiny shim
+# receives Trino's HTTP POST and just prints the body to ITS OWN stdout,
+# which fluent-bit already tails successfully via the existing `tail` input
+# (the same path Ranger's audit lines and every other pod's logs use).
+#
+# Apply: kubectl apply -f audit-shim.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trino-audit-shim
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trino-audit-shim
+  template:
+    metadata:
+      labels:
+        app: trino-audit-shim
+    spec:
+      containers:
+        - name: shim
+          image: python:3.12-alpine
+          command: ["python3", "/app/shim.py"]
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            - name: script
+              mountPath: /app
+      volumes:
+        - name: script
+          configMap:
+            name: trino-audit-shim-script
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trino-audit-shim-script
+  namespace: monitoring
+data:
+  shim.py: |
+    import http.server
+    import sys
+
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            try:
+                line = body.decode("utf-8", "replace").replace("\n", " ")
+            except Exception:
+                line = ""
+            if line:
+                sys.stdout.write(line + "\n")
+                sys.stdout.flush()
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass  # don't let request-access logs pollute the audit stream
+
+
+    http.server.ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trino-audit-shim
+  namespace: monitoring
+spec:
+  selector:
+    app: trino-audit-shim
+  ports:
+    - port: 8080
+      targetPort: 8080

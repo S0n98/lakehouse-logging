@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Replaces the previous ranger-trino-audit.xml, which pointed at
+  http://ranger-solr:6083/solr/ranger_audits, a service that does not exist
+  in this cluster, so every Ranger access-audit event was silently being
+  dropped (confirmed: no "solr" service/configmap anywhere in the cluster).
+
+  This version disables the dead Solr destination and enables the log4j
+  destination instead: audit events get logged as JSON lines to the Trino
+  coordinator/worker's own stdout, where they are already being tailed by
+  Fluent Bit (kube.* input); a rewrite_tag filter skims them back out into
+  the audit.ranger.trino stream -> OpenSearch ranger_audits-*.
+  See ../fluent-bit/values.yaml for that filter and the caveat about
+  verifying its regex against real output.
+-->
+<configuration>
+  <property>
+    <name>xasecure.audit.is.enabled</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>xasecure.audit.solr.is.enabled</name>
+    <value>false</value>
+  </property>
+  <property>
+    <name>xasecure.audit.log4j.is.enabled</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>xasecure.audit.log4j.is.async</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>xasecure.audit.log4j.async.max.queue.size</name>
+    <value>10240</value>
+  </property>
+</configuration>

@@ -1,0 +1,300 @@
+# Periodic Spark jobs (via the existing spark-operator) that load the raw
+# audit JSON Fluent Bit lands in MinIO into real Iceberg tables under the
+# `lakehouse` warehouse / Nessie catalog -- the cold, queryable archive.
+# See ../ARCHITECTURE.md for the full design and ../README.md for how to
+# verify it's working.
+#
+# spark-operator on this cluster only watches the `default` namespace
+# (spark.jobNamespaces in its helm values), so these must live there.
+#
+# One ScheduledSparkApplication per source rather than one job looping over
+# all three: independent schedules/retries/history, and a failure in one
+# source's load doesn't block the others. The three `template` blocks below
+# are identical except for `arguments` and `schedule` -- YAML anchors don't
+# carry across `---`-separated documents, so this is written out per
+# resource rather than shared, to keep each resource self-contained and
+# valid on its own.
+#
+# Apply:
+#   kubectl create configmap audit-archive-script -n default \
+#     --from-file=iceberg_archive_job.py=./iceberg_archive_job.py
+#   kubectl apply -f scheduled-spark-application.yaml
+---
+apiVersion: "sparkoperator.k8s.io/v1beta2"
+kind: ScheduledSparkApplication
+metadata:
+  name: audit-archive-ranger
+  namespace: default
+spec:
+  schedule: "5 * * * *"   # hourly, 5 min past -- gives fluent-bit's s3 output time to flush
+  concurrencyPolicy: Forbid
+  successfulRunHistoryLimit: 3
+  failedRunHistoryLimit: 3
+  template:
+    type: Python
+    mode: cluster
+    image: "apache/spark:3.5.3"
+    imagePullPolicy: IfNotPresent
+    mainApplicationFile: "local:///opt/scripts/iceberg_archive_job.py"
+    arguments: ["ranger"]
+    sparkVersion: "3.5.3"
+    deps:
+      packages:
+        - "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1"
+        - "org.apache.hadoop:hadoop-aws:3.3.4"
+        - "com.amazonaws:aws-java-sdk-bundle:1.12.262"
+        - "org.apache.iceberg:iceberg-aws-bundle:1.6.1"
+    sparkConf:
+      spark.sql.catalog.iceberg: "org.apache.iceberg.spark.SparkCatalog"
+      spark.sql.catalog.iceberg.catalog-impl: "org.apache.iceberg.rest.RESTCatalog"
+      spark.sql.catalog.iceberg.uri: "http://nessie.default.svc.cluster.local:19120/iceberg"
+      spark.sql.catalog.iceberg.warehouse: "lakehouse"
+      spark.sql.catalog.iceberg.s3.endpoint: "http://myminio-hl.default.svc.cluster.local:9000"
+      spark.sql.catalog.iceberg.s3.path-style-access: "true"
+      spark.jars.ivy: "/tmp/.ivy2"
+      spark.hadoop.fs.s3a.endpoint: "http://myminio-hl.default.svc.cluster.local:9000"
+      spark.hadoop.fs.s3a.path.style.access: "true"
+      spark.hadoop.fs.s3a.connection.ssl.enabled: "false"
+      spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    hadoopConf:
+      fs.s3a.endpoint: "http://myminio-hl.default.svc.cluster.local:9000"
+      fs.s3a.path.style.access: "true"
+      fs.s3a.connection.ssl.enabled: "false"
+      fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    restartPolicy:
+      type: OnFailure
+      onFailureRetries: 2
+      onFailureRetryInterval: 30
+      onSubmissionFailureRetries: 2
+      onSubmissionFailureRetryInterval: 30
+    volumes:
+      - name: audit-archive-script
+        configMap:
+          name: audit-archive-script
+    driver:
+      cores: 1
+      memory: "1g"
+      serviceAccount: spark-operator-spark
+      labels:
+        version: 3.5.3
+      volumeMounts:
+        - name: audit-archive-script
+          mountPath: /opt/scripts
+      env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: awsAccessKeyId
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: awsSecretAccessKey
+    executor:
+      cores: 1
+      instances: 1
+      memory: "1g"
+      serviceAccount: spark-operator-spark
+      labels:
+        version: 3.5.3
+      volumeMounts:
+        - name: audit-archive-script
+          mountPath: /opt/scripts
+      env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: awsAccessKeyId
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: awsSecretAccessKey
+---
+apiVersion: "sparkoperator.k8s.io/v1beta2"
+kind: ScheduledSparkApplication
+metadata:
+  name: audit-archive-trino
+  namespace: default
+spec:
+  schedule: "10 * * * *"
+  concurrencyPolicy: Forbid
+  successfulRunHistoryLimit: 3
+  failedRunHistoryLimit: 3
+  template:
+    type: Python
+    mode: cluster
+    image: "apache/spark:3.5.3"
+    imagePullPolicy: IfNotPresent
+    mainApplicationFile: "local:///opt/scripts/iceberg_archive_job.py"
+    arguments: ["trino"]
+    sparkVersion: "3.5.3"
+    deps:
+      packages:
+        - "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1"
+        - "org.apache.hadoop:hadoop-aws:3.3.4"
+        - "com.amazonaws:aws-java-sdk-bundle:1.12.262"
+        - "org.apache.iceberg:iceberg-aws-bundle:1.6.1"
+    sparkConf:
+      spark.sql.catalog.iceberg: "org.apache.iceberg.spark.SparkCatalog"
+      spark.sql.catalog.iceberg.catalog-impl: "org.apache.iceberg.rest.RESTCatalog"
+      spark.sql.catalog.iceberg.uri: "http://nessie.default.svc.cluster.local:19120/iceberg"
+      spark.sql.catalog.iceberg.warehouse: "lakehouse"
+      spark.sql.catalog.iceberg.s3.endpoint: "http://myminio-hl.default.svc.cluster.local:9000"
+      spark.sql.catalog.iceberg.s3.path-style-access: "true"
+      spark.jars.ivy: "/tmp/.ivy2"
+      spark.hadoop.fs.s3a.endpoint: "http://myminio-hl.default.svc.cluster.local:9000"
+      spark.hadoop.fs.s3a.path.style.access: "true"
+      spark.hadoop.fs.s3a.connection.ssl.enabled: "false"
+      spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    hadoopConf:
+      fs.s3a.endpoint: "http://myminio-hl.default.svc.cluster.local:9000"
+      fs.s3a.path.style.access: "true"
+      fs.s3a.connection.ssl.enabled: "false"
+      fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    restartPolicy:
+      type: OnFailure
+      onFailureRetries: 2
+      onFailureRetryInterval: 30
+      onSubmissionFailureRetries: 2
+      onSubmissionFailureRetryInterval: 30
+    volumes:
+      - name: audit-archive-script
+        configMap:
+          name: audit-archive-script
+    driver:
+      cores: 1
+      memory: "1g"
+      serviceAccount: spark-operator-spark
+      labels:
+        version: 3.5.3
+      volumeMounts:
+        - name: audit-archive-script
+          mountPath: /opt/scripts
+      env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: awsAccessKeyId
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: awsSecretAccessKey
+    executor:
+      cores: 1
+      instances: 1
+      memory: "1g"
+      serviceAccount: spark-operator-spark
+      labels:
+        version: 3.5.3
+      volumeMounts:
+        - name: audit-archive-script
+          mountPath: /opt/scripts
+      env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: awsAccessKeyId
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: awsSecretAccessKey
+---
+apiVersion: "sparkoperator.k8s.io/v1beta2"
+kind: ScheduledSparkApplication
+metadata:
+  name: audit-archive-superset
+  namespace: default
+spec:
+  schedule: "15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulRunHistoryLimit: 3
+  failedRunHistoryLimit: 3
+  template:
+    type: Python
+    mode: cluster
+    image: "apache/spark:3.5.3"
+    imagePullPolicy: IfNotPresent
+    mainApplicationFile: "local:///opt/scripts/iceberg_archive_job.py"
+    arguments: ["superset"]
+    sparkVersion: "3.5.3"
+    deps:
+      packages:
+        - "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1"
+        - "org.apache.hadoop:hadoop-aws:3.3.4"
+        - "com.amazonaws:aws-java-sdk-bundle:1.12.262"
+        - "org.apache.iceberg:iceberg-aws-bundle:1.6.1"
+    sparkConf:
+      spark.sql.catalog.iceberg: "org.apache.iceberg.spark.SparkCatalog"
+      spark.sql.catalog.iceberg.catalog-impl: "org.apache.iceberg.rest.RESTCatalog"
+      spark.sql.catalog.iceberg.uri: "http://nessie.default.svc.cluster.local:19120/iceberg"
+      spark.sql.catalog.iceberg.warehouse: "lakehouse"
+      spark.sql.catalog.iceberg.s3.endpoint: "http://myminio-hl.default.svc.cluster.local:9000"
+      spark.sql.catalog.iceberg.s3.path-style-access: "true"
+      spark.jars.ivy: "/tmp/.ivy2"
+      spark.hadoop.fs.s3a.endpoint: "http://myminio-hl.default.svc.cluster.local:9000"
+      spark.hadoop.fs.s3a.path.style.access: "true"
+      spark.hadoop.fs.s3a.connection.ssl.enabled: "false"
+      spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    hadoopConf:
+      fs.s3a.endpoint: "http://myminio-hl.default.svc.cluster.local:9000"
+      fs.s3a.path.style.access: "true"
+      fs.s3a.connection.ssl.enabled: "false"
+      fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    restartPolicy:
+      type: OnFailure
+      onFailureRetries: 2
+      onFailureRetryInterval: 30
+      onSubmissionFailureRetries: 2
+      onSubmissionFailureRetryInterval: 30
+    volumes:
+      - name: audit-archive-script
+        configMap:
+          name: audit-archive-script
+    driver:
+      cores: 1
+      memory: "1g"
+      serviceAccount: spark-operator-spark
+      labels:
+        version: 3.5.3
+      volumeMounts:
+        - name: audit-archive-script
+          mountPath: /opt/scripts
+      env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: awsAccessKeyId
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: awsSecretAccessKey
+    executor:
+      cores: 1
+      instances: 1
+      memory: "1g"
+      serviceAccount: spark-operator-spark
+      labels:
+        version: 3.5.3
+      volumeMounts:
+        - name: audit-archive-script
+          mountPath: /opt/scripts
+      env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: awsAccessKeyId
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: awsSecretAccessKey

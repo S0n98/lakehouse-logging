@@ -1,0 +1,77 @@
+# One-shot Job that provisions the cold-archive bucket on the existing
+# `myminio` tenant:
+#   - Object Lock enabled at creation (required for WORM retention; cannot be
+#     added to an existing bucket later)
+#   - Versioning enabled explicitly (Object Lock implies it, kept for clarity)
+#   - Default retention: GOVERNANCE, 365 days -- raise this, or switch to
+#     COMPLIANCE mode, to match your actual regulatory requirement
+#   - Lifecycle rule: expire objects after 2555 days (~7 years) -- adjust to
+#     your actual regulatory retention requirement
+#
+# Apply: kubectl apply -f create-audit-bucket-job.yaml
+# Then:  kubectl logs -n default job/create-audit-bucket
+#
+# Note: docker.io/minio/mc now requires auth for anonymous pulls
+# ("insufficient_scope"). quay.io/minio/mc is the public mirror -- verified
+# working during rollout on 2026-09-22.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: create-audit-bucket
+  namespace: default
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: mc
+          image: quay.io/minio/mc:latest
+          env:
+            - name: MC_ENDPOINT
+              value: "http://myminio-hl.default.svc.cluster.local:9000"
+            - name: MC_BUCKET
+              value: "audit-logs-cold"
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: awsAccessKeyId
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: awsSecretAccessKey
+          command: ["/bin/sh", "/scripts/setup.sh"]
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+      volumes:
+        - name: script
+          configMap:
+            name: create-audit-bucket-script
+            defaultMode: 0755
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: create-audit-bucket-script
+  namespace: default
+data:
+  setup.sh: |
+    set -e
+    mc alias set audit-minio "$MC_ENDPOINT" "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
+
+    if ! mc ls audit-minio/"$MC_BUCKET" >/dev/null 2>&1; then
+      mc mb --with-lock audit-minio/"$MC_BUCKET"
+      echo "bucket created with Object Lock enabled"
+    else
+      echo "bucket already exists, skipping creation"
+    fi
+
+    mc version enable audit-minio/"$MC_BUCKET"
+    mc retention set --default GOVERNANCE 365d audit-minio/"$MC_BUCKET"
+    mc ilm rule add audit-minio/"$MC_BUCKET" --expire-days 2555
+
+    mc retention info audit-minio/"$MC_BUCKET"
+    mc ilm rule ls audit-minio/"$MC_BUCKET"

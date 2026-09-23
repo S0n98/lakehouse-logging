@@ -1,0 +1,76 @@
+# One-shot Job: applies the hot(30d)->delete ISM policy to each audit index
+# pattern. Run once after OpenSearch is up.
+#
+# No snapshot repository is registered here -- the cold, queryable copy is
+# independent (fluent-bit lands raw JSON in MinIO, a periodic Spark job
+# loads it into Iceberg tables, see ../spark/), so OpenSearch's ISM policy
+# only needs to expire the hot copy, not snapshot it first.
+#
+# Apply: kubectl apply -f post-install-setup-job.yaml
+# Then:  kubectl logs -n logging job/opensearch-post-install-setup
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: opensearch-post-install-setup
+  namespace: logging
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: setup
+          image: curlimages/curl:latest
+          env:
+            - name: OS_HOST
+              value: "https://opensearch-cluster-master:9200"
+            - name: OS_USER
+              value: "admin"
+            - name: OS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: opensearch-admin-password
+                  key: OPENSEARCH_INITIAL_ADMIN_PASSWORD
+          command: ["/bin/sh", "/scripts/run.sh"]
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+            - name: policies
+              mountPath: /policies
+      volumes:
+        - name: script
+          configMap:
+            name: os-post-install-script
+            defaultMode: 0755
+        - name: policies
+          projected:
+            sources:
+              - configMap:
+                  name: ism-ranger-audit
+              - configMap:
+                  name: ism-trino-audit
+              - configMap:
+                  name: ism-superset-audit
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: os-post-install-script
+  namespace: logging
+data:
+  run.sh: |
+    set -e
+    for name in ranger-audit trino-audit superset-audit; do
+      policy_id="${name}-policy"
+      echo "--- applying ${policy_id} ---"
+      # ISM policy updates need optimistic-concurrency params if the policy
+      # already exists; simplest is delete-then-recreate for this
+      # occasional, one-shot setup script (not a hot path).
+      curl -sk -u "${OS_USER}:${OS_PASSWORD}" \
+        -X DELETE "${OS_HOST}/_plugins/_ism/policies/${policy_id}" >/dev/null
+      curl -sk -u "${OS_USER}:${OS_PASSWORD}" \
+        -X PUT "${OS_HOST}/_plugins/_ism/policies/${policy_id}" \
+        -H 'Content-Type: application/json' \
+        -d @"/policies/${name}-ism.json"
+      echo
+    done
