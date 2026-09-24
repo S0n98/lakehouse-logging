@@ -1,0 +1,42 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ranger-group-sync-reconcile
+  namespace: ranger-group-sync
+spec:
+  # Hourly is a reasonable starting point -- tighten it if your
+  # compliance requirements need faster drift detection, but remember
+  # this job re-reads your entire user population from the IdP every run,
+  # so check what that costs your IdP's API before going much tighter.
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: reconcile
+              image: <REPLACE-ME>/ranger-group-sync:latest
+              args: ["reconcile.py"]
+              env:
+                - name: RANGER_URL
+                  value: "http://ranger-apache-ranger.ranger.svc.cluster.local:6080"
+                - name: RANGER_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: ranger-group-sync-secrets
+                      key: RANGER_USER
+                - name: RANGER_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: ranger-group-sync-secrets
+                      key: RANGER_PASSWORD
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi

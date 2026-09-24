@@ -1,2 +1,5 @@
 # Claude Code session state -- not part of the project
 .claude/
+
+__pycache__/
+*.pyc

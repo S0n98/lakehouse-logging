@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ranger-group-sync-consumer
+  namespace: ranger-group-sync
+spec:
+  # Exactly 1 replica per Kafka partition you create for the topic (see
+  # IMPLEMENTATION-GUIDE.md step 3) -- Kafka consumer groups only let one
+  # consumer instance read a given partition at a time, so replicas beyond
+  # the partition count sit idle. Start with 1 replica / 1 partition;
+  # scale both together later if throughput needs it.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ranger-group-sync-consumer
+  template:
+    metadata:
+      labels:
+        app: ranger-group-sync-consumer
+    spec:
+      containers:
+        - name: consumer
+          image: <REPLACE-ME>/ranger-group-sync:latest
+          args: ["sync_service.py"]
+          env:
+            - name: RANGER_URL
+              value: "http://ranger-apache-ranger.ranger.svc.cluster.local:6080"
+            - name: KAFKA_TOPIC
+              value: "user-attribute-changed"
+            - name: KAFKA_GROUP_ID
+              value: "ranger-group-sync"
+            - name: RANGER_USER
+              valueFrom:
+                secretKeyRef:
+                  name: ranger-group-sync-secrets
+                  key: RANGER_USER
+            - name: RANGER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ranger-group-sync-secrets
+                  key: RANGER_PASSWORD
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                secretKeyRef:
+                  name: ranger-group-sync-secrets
+                  key: KAFKA_BOOTSTRAP_SERVERS
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
