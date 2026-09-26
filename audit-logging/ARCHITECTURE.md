@@ -54,30 +54,30 @@ flowchart LR
     subgraph Collection [fluent-bit DaemonSet]
         Tail["tail input\n(/var/log/containers/*.log)\nALREADY existed, feeds Loki"]
         K8sFilter["kubernetes filter\n(pod metadata + Merge_Log)"]
-        RW1["rewrite_tag:\nrepoType field\n-> audit.ranger.trino"]
-        RW2["rewrite_tag:\nqueryId field\n-> audit.trino"]
+        RW1["rewrite_tag:\nraw $log text\ncontains repoType\n-> audit.ranger.trino"]
+        RW2["rewrite_tag:\nmetadata.queryId field\n-> audit.trino"]
         RW3["rewrite_tag:\naudit_source=superset\n-> audit.superset"]
     end
 
     Shim["trino-audit-shim\n(tiny stdout printer)"]
 
-    subgraph Hot [OpenSearch - hot, 30d, searchable]
+    subgraph Hot [OpenSearch - hot, 7d, searchable]
         IdxR["ranger_audits-*"]
         IdxT["trino_query_audit-*"]
         IdxS["superset_audit-*"]
-        ISM["ISM policy per index:\nhot 30d -> delete\n(cold copy is independent, below)"]
+        ISM["ISM policy per index:\nhot 7d -> delete\n(cold copy is independent, below)"]
     end
 
-    subgraph RawLanding [MinIO - raw landing, Object Lock]
-        RawR["audit-logs-cold/raw/ranger/"]
-        RawT["audit-logs-cold/raw/trino/"]
-        RawS["audit-logs-cold/raw/superset/"]
+    subgraph RawLanding [MinIO - raw landing, no Object Lock]
+        RawR["audit-logs-raw/raw/ranger/"]
+        RawT["audit-logs-raw/raw/trino/"]
+        RawS["audit-logs-raw/raw/superset/"]
     end
 
     subgraph SparkJobs [spark-operator - hourly ScheduledSparkApplications]
-        SparkR["audit-archive-ranger"]
-        SparkT["audit-archive-trino"]
-        SparkS["audit-archive-superset"]
+        SparkR["audit-archive-ranger\nMERGE INTO + delete if\nmerged AND >=30d old"]
+        SparkT["audit-archive-trino\nMERGE INTO + delete if\nmerged AND >=30d old"]
+        SparkS["audit-archive-superset\nMERGE INTO + delete if\nmerged AND >=30d old"]
     end
 
     subgraph Cold [Iceberg tables - lakehouse warehouse, queryable forever]
@@ -99,7 +99,7 @@ flowchart LR
     RW2 --> RawT
     RW3 --> RawS
 
-    IdxR & IdxT & IdxS -.->|ISM: after 30d| ISM
+    IdxR & IdxT & IdxS -.->|ISM: after 7d| ISM
 
     RawR --> SparkR --> TblR
     RawT --> SparkT --> TblT
@@ -156,17 +156,22 @@ above is specifically about the `http` *input*.
 
 ## Loading raw JSON into Iceberg (the cold tier)
 
-Each source's raw JSON lands in the Object-Lock-protected `audit-logs-cold`
-bucket, partitioned by fluent-bit's `s3_key_format` into
-`raw/<source>/%Y/%m/%d/%H/`. Once an hour, a `ScheduledSparkApplication`
-per source (`spark/scheduled-spark-application.yaml`) reads that source's
-entire raw prefix and appends the results into an Iceberg table via a
-dynamic partition overwrite (`spark/iceberg_archive_job.py`) -- re-running
-for data that's already been loaded recomputes those partitions instead of
-duplicating rows, so it's safe to re-run or run out of order. Raw files are
-never deleted or moved by this job: they stay in MinIO as the immutable
-original, independent of whatever the Iceberg-loading logic does or how it
-changes in the future.
+Each source's raw JSON lands in the `audit-logs-raw` bucket, partitioned by
+fluent-bit's `s3_key_format` into `raw/<source>/%Y/%m/%d/%H/`. Once an
+hour, a `ScheduledSparkApplication` per source
+(`spark/scheduled-spark-application.yaml`) reads that source's entire raw
+prefix and `MERGE INTO`s the results into an Iceberg table
+(`spark/iceberg_archive_job.py`), keyed on `record_id = sha256(raw_json)`
+-- re-running for data that's already been loaded is a safe no-op (matched
+by `record_id`, nothing re-inserted), so it's safe to re-run or run out of
+order. Once a file's records are confirmed merged **and** the file is at
+least 30 days old, the job deletes it -- see "Raw landing retention" below
+for why it's both conditions, not just the first one.
+
+(This replaced an earlier design that read the same raw prefix but wrote
+via a dynamic partition overwrite and never deleted raw files at all,
+relying on the bucket's Object Lock for immutability instead of
+application logic. See "Raw landing retention" below for why that changed.)
 
 Two non-obvious things had to be worked out to make this run at all, both
 already reflected in `scheduled-spark-application.yaml`:
@@ -294,33 +299,127 @@ upstream service's actual output matches those assumptions.
 
 | Tier | Store | Duration | Mechanism |
 |---|---|---|---|
-| Hot | OpenSearch | 30 days | ISM policy: hot -> delete |
-| Raw landing | MinIO (`audit-logs-cold/raw/`) | 7 years (2555 days), Object Lock 365d | Bucket lifecycle rule + WORM |
+| Hot | OpenSearch | 7 days | ISM policy: hot -> delete |
+| Raw landing | MinIO (`audit-logs-raw/raw/`) | 30 days, gated on confirmed Iceberg merge | `spark/iceberg_archive_job.py`, app-level |
 | Cold, queryable | Iceberg (`lakehouse/audit/*`) | indefinite | Never expired by anything in this pipeline |
 
 The three tiers are independent, not a single pipeline where one feeds the
-next: OpenSearch's hot copy simply expires after 30 days (nothing reads it
-before deleting it); the raw JSON in MinIO is the immutable original,
-protected by Object Lock, expiring on its own schedule; the Iceberg tables
-are the durable, queryable archive and nothing in this design ever deletes
-data from them (add a retention job of your own if that's needed later).
+next: OpenSearch's hot copy simply expires after 7 days (nothing reads it
+before deleting it); the Iceberg tables are the durable, queryable archive
+and nothing in this design ever deletes data from them (add a retention
+job of your own if that's needed later — still an open gap, see below).
+Raw landing is the one tier where deletion actually depends on the other
+two: a raw file is only deleted once **both** hold: it's been confirmed
+merged into Iceberg (checked fresh in the same job run, never assumed from
+history) **and** it's at least 30 days old. See the next section for why
+it's a real dependency, and why age matters as well as confirmation.
 
-Object Lock is GOVERNANCE mode (365-day default retention per object) —
-even an admin can't casually delete/overwrite raw objects inside that
-window without an explicit retention-bypass permission. This applies only
-to the raw landing zone, not the Iceberg tables themselves: Iceberg's own
-maintenance operations (compaction, snapshot expiry) need to delete old
-data/metadata files as part of normal operation, which is fundamentally
-incompatible with Object Lock — so the `lakehouse` warehouse bucket
-deliberately does *not* have Object Lock, only the raw landing zone does.
-
-These durations (30d hot, 7y raw) are placeholder defaults, not derived
+These durations (7d hot, 30d raw) are placeholder defaults, not derived
 from any stated regulatory requirement — adjust `min_index_age` in
-`ism-policies/*.json` and `--expire-days` in
-`minio/create-audit-bucket-job.yaml` to match actual policy.
+`ism-policies/*.json` and `MIN_AGE_SECONDS_BEFORE_DELETE` in
+`spark/iceberg_archive_job.py` to match actual policy.
+
+## Raw landing retention: from "never delete" to a 30-day gated model
+
+The original design (see git history) never deleted raw files at all —
+they were meant to sit forever in `audit-logs-cold`, a bucket created with
+Object Lock (WORM, GOVERNANCE mode, 365-day default retention) as a
+compliance/legal-hold-style immutable copy, independent of whatever the
+Iceberg-loading logic did.
+
+That held up until a design review asked the obvious next question: once
+a raw file's data is confirmed safely archived in Iceberg, why keep it
+forever? Two things had to be worked out before that could actually be
+implemented:
+
+**1. The existing job's re-derive-everything design was incompatible with
+deleting anything.** The old job read the *entire* raw prefix on every
+run and overwrote each Iceberg partition wholesale with whatever it just
+read (`spark.sql.sources.partitionOverwriteMode=dynamic` +
+`.overwritePartitions()`) — deliberately idempotent by full recomputation
+rather than an incremental watermark. Deleting a raw file right after
+confirming it was archived would mean the *next* run recomputes that
+partition from a now-smaller raw file set, silently dropping the deleted
+file's records from Iceberg one run later. Fixed by switching to
+`MERGE INTO ... WHEN NOT MATCHED THEN INSERT`, keyed on
+`record_id = sha256(raw_json)` — an actual append, not a
+recompute-and-replace, so a file can be deleted immediately after its data
+is durably present without anything downstream ever needing to re-derive
+from it again. (This is also what makes it safe to re-merge a file that's
+still sitting there because it isn't 30 days old yet, or because a
+previous run crashed between committing the merge and deleting the file —
+both are just idempotent no-ops against the `record_id` key.)
+
+**2. The `audit-logs-cold` bucket's Object Lock made "delete once
+confirmed" structurally impossible, independent of the job's logic.**
+Verified live before assuming this: `get_object_lock_configuration`
+confirmed the bucket has `ObjectLockEnabled: Enabled`,
+`DefaultRetention: {Mode: GOVERNANCE, Days: 365}`; `head_object` on a real
+raw file confirmed `ObjectLockMode: GOVERNANCE` with a real
+`ObjectLockRetainUntilDate` a year out. GOVERNANCE mode rejects a plain
+delete outright unless the caller has `s3:BypassGovernanceRetention`
+(which nothing in this pipeline is granted, deliberately — see Security
+notes). And Object Lock, once enabled at bucket creation, **cannot be
+removed** from that bucket by any later configuration change. So
+reconfiguring `audit-logs-cold` wasn't an option at all — the fix was a
+new bucket, `audit-logs-raw`, created without Object Lock specifically so
+the Spark job could own retention itself
+(`minio/create-audit-raw-bucket-job.yaml`). `audit-logs-cold`'s existing
+files are untouched legacy data, draining on their own original 365-day
+locks — nothing reads or writes that bucket going forward.
+
+**Why age-gate at all, instead of deleting the moment a file is
+confirmed merged?** A successful Iceberg commit only proves the write
+*ran without erroring* — it doesn't rule out a bug in this job's own
+transform logic silently producing wrong output that still commits
+cleanly. The 30-day floor is a recovery window against exactly that class
+of bug: if the archived data is ever found to be subtly wrong, the raw
+originals are still there to reload from, for a month. Confirmation alone
+(delete immediately after a successful merge) was considered and rejected
+for this reason — it protects against Iceberg-write *failures* but not
+against Iceberg-write *bugs*, which this cluster's own history (see "Bugs
+found and fixed during rollout" above) suggests aren't hypothetical.
+
+**Verified live after deploying this** (2026-09-26): confirmed schema
+migration + backfill on already-populated tables, a fresh merge of new
+records, re-running the same job against not-yet-deleted files as a safe
+no-op (re-checked via `GROUP BY record_id HAVING count(*) > 1`, which
+found zero new duplicates from the rerun), and that files younger than 30
+days survive being processed (`kept (merged but <30d old)` in the driver
+log). One pre-existing duplicate turned up in `trino_query_audit` during
+this check — both rows are byte-identical copies of a 2026-09-23
+synthetic test record (`queryId: S3TEST_TR`), left over from **before**
+this migration (the old `overwritePartitions` design had no dedup at all,
+so nothing prevented it). The backfill correctly computed matching
+`record_id`s for both, which is exactly how it surfaced; it isn't new,
+and it isn't something this design's `record_id` key is meant to catch —
+`record_id` prevents new duplicates going forward, it doesn't retroactively
+clean up whatever data quality issues existed in what it's backfilling.
+Left as-is (2 harmless copies of a synthetic test row, not real audit
+data) rather than risk a manual row-level delete on live Iceberg data for
+no real benefit.
+
+**One real limitation this surfaced, worth stating plainly:** the
+idempotency guarantee holds for the *deployed* system, where
+`concurrencyPolicy: Forbid` on each `ScheduledSparkApplication` ensures a
+source's job never overlaps with itself. It is **not** a guarantee against
+two overlapping writers in general — e.g. manually submitting an ad-hoc
+`SparkApplication` for a source while its schedule might also be about to
+fire. `MERGE INTO ... WHEN NOT MATCHED` checks "does this key already
+exist" against a snapshot at the start of each statement; two concurrent
+MERGEs can both see "not present" and both insert, producing a real
+duplicate (not a bug in this job, but a known limitation of using MERGE
+for dedup under concurrent writers, without an additional
+uniqueness-enforcing layer). Don't manually trigger a source's job (e.g.
+via the `force-reconcile` annotation trick) without confirming its
+regularly-scheduled run isn't also in flight.
 
 ## Security notes
 
+- Nothing in this pipeline is granted `s3:BypassGovernanceRetention` on
+  the legacy `audit-logs-cold` bucket. Its remaining locked files are
+  meant to expire naturally on their original schedule, not be
+  early-deleted by anything — see "Raw landing retention" above.
 - OpenSearch's security plugin is enabled with the image's own
   auto-generated demo TLS certificates (self-signed). This is acceptable
   because OpenSearch is reachable only inside the cluster network — replace

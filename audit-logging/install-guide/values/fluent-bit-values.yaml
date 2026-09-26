@@ -26,25 +26,42 @@
 # JSON payload -> a dedicated `opensearch` output per resulting tag.
 #   - Ranger access-audit: Trino's Ranger plugin logs audit JSON to its own
 #     stdout once the log4j destination is enabled (see
-#     ../ranger/ranger-trino-audit.xml). Matched on the "repoType" field.
+#     ../ranger/ranger-trino-audit.xml). Matched on the raw log text
+#     containing "repoType" (see CAVEAT below for why this is a raw-text
+#     match, not a merged-field match like the other two sources).
 #   - Trino query-audit: Trino's http-event-listener plugin can only POST
 #     over HTTP, so it posts to ../trino/audit-shim.yaml, a tiny sidecar
 #     service in this namespace that just prints the POST body to ITS OWN
 #     stdout -- landing it in the same already-working tail stream. Matched
-#     on the "queryId" field (present on every http-event-listener payload).
+#     on "metadata.queryId" (present on every http-event-listener payload;
+#     note it's nested under "metadata", NOT top-level -- confirmed against
+#     real payloads on 2026-09-23, a top-level "$queryId" rule never matches
+#     anything).
 #   - Superset action-audit: Superset's custom EVENT_LOGGER (see
 #     ../superset/event-logger.py) prints straight to Superset's own stdout
 #     -- no network hop needed at all. Matched on "audit_source":"superset"
 #     (named to avoid "_source", which is a reserved OpenSearch metadata
 #     field name and fails to index if used as a real document field).
 #
-# CAVEAT: the ranger rewrite_tag Rule field ("repoType") is Ranger's
-# documented, stable audit-record field name, but it has NOT yet been
-# verified against this exact plugin build's real log4j output on this
-# cluster (only tested against a synthetic marker line). After enabling the
-# Ranger log4j audit destination, check `kubectl logs` on a trino coordinator
-# pod for the actual audit line shape and adjust this rule if needed -- see
-# ../README.md "Verifying the Ranger audit filter".
+# RANGER AUDIT SHAPE -- confirmed against real output 2026-09-23, two things
+# that are NOT obvious from Ranger's docs:
+#   1. The async log4j destination (xasecure.audit.log4j.is.async=true) only
+#      flushes its queue when full or on JVM shutdown UNLESS
+#      xasecure.audit.log4j.async.max.flush.interval.ms is also set (see
+#      ../ranger/ranger-trino-audit.xml) -- without it, audit events for a
+#      handful of test queries just sit buffered forever and never appear
+#      anywhere, with no error.
+#   2. The actual log line Trino writes is airlift's own tab-separated
+#      format (timestamp\tLEVEL\tthread\tlogger-name\t<the audit JSON>), NOT
+#      a bare JSON line -- so the `kubernetes` filter's Merge_Log (which
+#      requires the ENTIRE line to be valid JSON) fails to parse it, and
+#      "repoType" never becomes a top-level merged field. That's why the
+#      rewrite_tag rule below matches raw $log text instead of a merged
+#      field, and why two extra [FILTER] parser stages further down pull
+#      the trailing JSON substring back out into real fields (reqUser,
+#      access, resource, etc.) for the ranger_audits-* index -- otherwise
+#      every Ranger audit document in OpenSearch would just be one giant
+#      unsearchable raw-text blob.
 
 config:
   filters: |
@@ -59,13 +76,31 @@ config:
     [FILTER]
         Name          rewrite_tag
         Match         kube.*
-        Rule          $repoType ^.*$ audit.ranger.trino true
+        Rule          $log ^.*repoType.*$ audit.ranger.trino true
         Emitter_Name  ranger_audit_emitter
+
+    # Pulls the trailing JSON audit record back out of Trino's tab-separated
+    # log line (see the RANGER AUDIT SHAPE note above) into real fields.
+    # Two stages: first regex-extract the JSON substring into a field named
+    # "audit_json", then decode that field's value as JSON, merging it in.
+    [FILTER]
+        Name        parser
+        Match       audit.ranger.trino
+        Key_Name    log
+        Parser      ranger_audit_extract
+        Reserve_Data On
+
+    [FILTER]
+        Name        parser
+        Match       audit.ranger.trino
+        Key_Name    audit_json
+        Parser      json_decode
+        Reserve_Data On
 
     [FILTER]
         Name          rewrite_tag
         Match         kube.*
-        Rule          $queryId ^.*$ audit.trino true
+        Rule          $metadata['queryId'] ^.*$ audit.trino true
         Emitter_Name  trino_audit_emitter
 
     [FILTER]
@@ -149,12 +184,23 @@ config:
     # safe: multiple outputs matching one tag works fine for tail-sourced
     # records -- verified 2026-09-23; this is a DIFFERENT code path than the
     # http-input bug documented above, which was about the INPUT side).
-    # Raw files are never deleted/moved by the Spark job -- they sit here,
-    # in the Object-Lock-protected bucket, as the immutable original copy.
+    #
+    # Bucket is `audit-logs-raw`, deliberately WITHOUT Object Lock -- the
+    # Spark job now deletes a raw file once it's confirmed merged into
+    # Iceberg AND at least 30 days old (see ../spark/iceberg_archive_job.py).
+    # An earlier design pointed this at `audit-logs-cold` (Object Lock,
+    # GOVERNANCE, 365d) intending to never delete raw files at all; that
+    # bucket's lock turned out to structurally block any early deletion
+    # regardless of application logic (confirmed live via
+    # get_object_lock_configuration/head_object before migrating), and
+    # Object Lock can't be removed from a bucket once enabled at creation --
+    # hence the new bucket rather than reconfiguring the old one. The old
+    # bucket's files are untouched legacy data draining on their original
+    # 365-day locks. See ../ARCHITECTURE.md.
     [OUTPUT]
         Name                 s3
         Match                audit.ranger.*
-        bucket               audit-logs-cold
+        bucket               audit-logs-raw
         endpoint             http://myminio-hl.default.svc.cluster.local:9000
         region               us-east-1
         s3_key_format        /raw/ranger/%Y/%m/%d/%H/$UUID.json
@@ -165,7 +211,7 @@ config:
     [OUTPUT]
         Name                 s3
         Match                audit.trino
-        bucket               audit-logs-cold
+        bucket               audit-logs-raw
         endpoint             http://myminio-hl.default.svc.cluster.local:9000
         region               us-east-1
         s3_key_format        /raw/trino/%Y/%m/%d/%H/$UUID.json
@@ -176,7 +222,7 @@ config:
     [OUTPUT]
         Name                 s3
         Match                audit.superset
-        bucket               audit-logs-cold
+        bucket               audit-logs-raw
         endpoint             http://myminio-hl.default.svc.cluster.local:9000
         region               us-east-1
         s3_key_format        /raw/superset/%Y/%m/%d/%H/$UUID.json
@@ -189,10 +235,24 @@ config:
         Flush         5
         Log_Level     info
         Parsers_File  parsers.conf
+        Parsers_File  custom_parsers.conf
         HTTP_Server   On
         HTTP_Listen   0.0.0.0
         HTTP_Port     2020
         Health_Check  On
+
+  # Used by the ranger_audit_trino filter chain above -- see the RANGER
+  # AUDIT SHAPE note near the top of this file for why these two stages
+  # (regex-extract then JSON-decode) are needed instead of a single parser.
+  customParsers: |
+    [PARSER]
+        Name    ranger_audit_extract
+        Format  regex
+        Regex   ^[^\t]*\t[^\t]*\t[^\t]*\t[^\t]*\t(?<audit_json>\{.*\})$
+
+    [PARSER]
+        Name    json_decode
+        Format  json
 
 resources:
   requests:

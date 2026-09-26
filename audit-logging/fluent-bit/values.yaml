@@ -184,12 +184,23 @@ config:
     # safe: multiple outputs matching one tag works fine for tail-sourced
     # records -- verified 2026-09-23; this is a DIFFERENT code path than the
     # http-input bug documented above, which was about the INPUT side).
-    # Raw files are never deleted/moved by the Spark job -- they sit here,
-    # in the Object-Lock-protected bucket, as the immutable original copy.
+    #
+    # Bucket is `audit-logs-raw`, deliberately WITHOUT Object Lock -- the
+    # Spark job now deletes a raw file once it's confirmed merged into
+    # Iceberg AND at least 30 days old (see ../spark/iceberg_archive_job.py).
+    # An earlier design pointed this at `audit-logs-cold` (Object Lock,
+    # GOVERNANCE, 365d) intending to never delete raw files at all; that
+    # bucket's lock turned out to structurally block any early deletion
+    # regardless of application logic (confirmed live via
+    # get_object_lock_configuration/head_object before migrating), and
+    # Object Lock can't be removed from a bucket once enabled at creation --
+    # hence the new bucket rather than reconfiguring the old one. The old
+    # bucket's files are untouched legacy data draining on their original
+    # 365-day locks. See ../ARCHITECTURE.md.
     [OUTPUT]
         Name                 s3
         Match                audit.ranger.*
-        bucket               audit-logs-cold
+        bucket               audit-logs-raw
         endpoint             http://myminio-hl.default.svc.cluster.local:9000
         region               us-east-1
         s3_key_format        /raw/ranger/%Y/%m/%d/%H/$UUID.json
@@ -200,7 +211,7 @@ config:
     [OUTPUT]
         Name                 s3
         Match                audit.trino
-        bucket               audit-logs-cold
+        bucket               audit-logs-raw
         endpoint             http://myminio-hl.default.svc.cluster.local:9000
         region               us-east-1
         s3_key_format        /raw/trino/%Y/%m/%d/%H/$UUID.json
@@ -211,7 +222,7 @@ config:
     [OUTPUT]
         Name                 s3
         Match                audit.superset
-        bucket               audit-logs-cold
+        bucket               audit-logs-raw
         endpoint             http://myminio-hl.default.svc.cluster.local:9000
         region               us-east-1
         s3_key_format        /raw/superset/%Y/%m/%d/%H/$UUID.json

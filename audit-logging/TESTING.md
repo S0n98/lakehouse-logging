@@ -166,7 +166,63 @@ kubectl exec -n default deploy/trino-coordinator -- trino --execute "
 confirm every count increased. A count that hasn't moved despite the
 schedule "running" is exactly Test 4's gotcha.
 
-### 7. install-guide integrity
+### 7. Raw landing: idempotent merge + age-gated deletion
+
+Verifies the retention redesign from 2026-09-26 (see `ARCHITECTURE.md`'s
+"Raw landing retention"): a raw file should be deleted once confirmed
+merged into Iceberg **and** at least 30 days old -- never before either
+condition holds.
+
+**7a. New records don't duplicate on re-merge (idempotency):**
+```bash
+# note the current row count, then manually re-trigger a run for one
+# source (kubectl create job --from=cronjob equivalent, or wait for the
+# schedule to fire again naturally) without any new raw files landing in
+# between
+kubectl exec -n default deploy/trino-coordinator -- trino --execute \
+  "SELECT count(*) FROM iceberg.audit.ranger_audit"
+# ... trigger a run ...
+kubectl exec -n default deploy/trino-coordinator -- trino --execute \
+  "SELECT count(*) FROM iceberg.audit.ranger_audit"
+```
+**Pass:** the count is unchanged after the second run -- the same raw
+files got re-read and re-merged, and `record_id` matching made every
+insert attempt a no-op.
+
+**7b. Files younger than 30 days survive being processed:**
+```bash
+export AWS_ACCESS_KEY_ID=$(kubectl get secret minio-credentials -n default -o jsonpath='{.data.awsAccessKeyId}' | base64 -d)
+export AWS_SECRET_ACCESS_KEY=$(kubectl get secret minio-credentials -n default -o jsonpath='{.data.awsSecretAccessKey}' | base64 -d)
+python3 -c "
+import boto3, os
+s3 = boto3.client('s3', endpoint_url='http://myminio-hl.default.svc.cluster.local:9000',
+    aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'], aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'],
+    region_name='us-east-1')
+resp = s3.list_objects_v2(Bucket='audit-logs-raw', Prefix='raw/')
+print(resp.get('KeyCount', 0), 'objects still present')
+"
+```
+**Pass:** run this right after a Spark job completes -- objects newer than
+30 days are still present (check driver logs for
+`kept (merged but <30d old)` matching the object count), confirming the
+job didn't delete anything prematurely just because it was successfully
+merged.
+
+**7c. Files past 30 days actually get deleted (needs a synthetic
+backdated file, since waiting 30 real days isn't practical to test with):**
+```bash
+# land one throwaway object, then rewrite its LastModified by re-uploading
+# with an explicit old mtime isn't directly supported by S3 semantics --
+# easiest real test is temporarily lowering MIN_AGE_SECONDS_BEFORE_DELETE
+# in a scratch copy of iceberg_archive_job.py (e.g. to 60 seconds), running
+# it against a disposable test prefix, and confirming deletion fires; do
+# not lower the real deployed value to test this against production data.
+```
+**Pass:** driver logs show `X deleted (merged + >=30d old)` with X > 0 for
+files older than whatever threshold you tested with, and the bucket
+listing confirms they're actually gone afterward.
+
+### 8. install-guide integrity
 
 ```bash
 for f in ../audit-logging/install-guide/charts/*.tgz; do

@@ -23,6 +23,17 @@ top-level), Ranger's async audit queue needed an explicit flush interval,
 and Ranger's audit JSON is embedded in Trino's tab-separated log format
 rather than being a bare JSON line.
 
+**Updated 2026-09-26: retention model redesigned after an architecture
+review.** Hot tier is now 7 days (was 30). Raw landing moved to a new
+bucket (`audit-logs-raw`, no Object Lock) with a 30-day retention gated on
+confirmed Iceberg archival, replacing an earlier "never delete" design
+whose bucket turned out to structurally block early deletion via Object
+Lock regardless of application logic. The Spark job switched from a
+dynamic-partition-overwrite write to an idempotent `MERGE INTO` keyed on
+`record_id = sha256(raw_json)`, which is what makes safe-to-delete
+possible at all -- see `ARCHITECTURE.md`'s "Raw landing retention" section
+for the full reasoning.
+
 ## What's here
 
 ```
@@ -32,12 +43,14 @@ fluent-bit/    The collector: routes Ranger/Trino/Superset audit lines to
                both OpenSearch (hot) and MinIO raw landing (cold source).
                Read the header comment in values.yaml before touching this
                file -- there's a real fluent-bit bug its design works around.
-minio/         The audit-logs-cold bucket (Object Lock, ILM) -- raw JSON
-               landing zone, the input to the Spark->Iceberg load.
+minio/         The audit-logs-raw bucket (no Object Lock; retention is
+               app-managed by the Spark job, see below) -- raw JSON
+               landing zone, the input to the Spark->Iceberg load. Also
+               has the legacy, Object-Lock'd create-audit-bucket-job.yaml.
 spark/         The periodic Spark job that loads raw JSON into Iceberg
                tables under the `lakehouse` warehouse. This is the actual
                cold, queryable archive.
-ism-policies/  Per-source hot(30d)->delete lifecycle policies for OpenSearch.
+ism-policies/  Per-source hot(7d)->delete lifecycle policies for OpenSearch.
 ranger/        Fixes Ranger's audit destination (was silently broken) and
                grants the real-user-impersonation policy Superset needs.
 trino/         Query-audit event listener + the shim it needs (see below).
@@ -61,14 +74,16 @@ Fluent Bit's `tail` input already reads (it's the same input already
 shipping every pod's logs to Loki). A `rewrite_tag` filter per source
 picks these lines back out by a field unique to that source's JSON shape,
 and re-emits them to **two** outputs: an `opensearch` output (hot,
-searchable, 30-day retention) and an `s3` output that lands the same raw
+searchable, 7-day retention) and an `s3` output that lands the same raw
 JSON in MinIO, partitioned by hour. Once an hour, a
 `ScheduledSparkApplication` per source reads that source's raw JSON and
-loads it into a real Iceberg table under the cluster's existing
+merges it into a real Iceberg table under the cluster's existing
 `lakehouse` warehouse (same Nessie catalog Trino's `iceberg` catalog
 already uses) -- queryable forever with plain SQL, independent of
-whatever OpenSearch's hot-tier retention does. Full reasoning in
-`ARCHITECTURE.md`.
+whatever OpenSearch's hot-tier retention does. Once a raw file's data is
+confirmed merged and the file is 30+ days old, it's deleted -- see
+`ARCHITECTURE.md`'s "Raw landing retention" for the full reasoning
+(including why that wasn't always possible).
 
 ## Install order
 
@@ -112,9 +127,13 @@ helm install opensearch-dashboards opensearch/opensearch-dashboards \
 ### 2. MinIO raw landing bucket
 
 ```bash
-kubectl apply -f minio/create-audit-bucket-job.yaml
-kubectl logs -n default job/create-audit-bucket   # confirm success
+kubectl apply -f minio/create-audit-raw-bucket-job.yaml
+kubectl logs -n default job/create-audit-raw-bucket   # confirm success
 ```
+
+(`minio/create-audit-bucket-job.yaml`, provisioning the old `audit-logs-cold`
+bucket with Object Lock, is legacy -- do not apply it for a new install.
+See `ARCHITECTURE.md`'s "Raw landing retention" section for why.)
 
 ### 3. ISM policies (needs step 1 done first)
 
@@ -272,7 +291,7 @@ kubectl logs v -n logging
 AK=$(kubectl get secret minio-credentials -n default -o jsonpath='{.data.awsAccessKeyId}' | base64 -d)
 SK=$(kubectl get secret minio-credentials -n default -o jsonpath='{.data.awsSecretAccessKey}' | base64 -d)
 kubectl run mc --restart=Never -n default --image=quay.io/minio/mc:latest --command -- \
-  sh -c "mc alias set m http://myminio-hl.default.svc.cluster.local:9000 $AK $SK && mc ls -r m/audit-logs-cold/raw/trino/"
+  sh -c "mc alias set m http://myminio-hl.default.svc.cluster.local:9000 $AK $SK && mc ls -r m/audit-logs-raw/raw/trino/"
 ```
 
 For Ranger, provoke any Trino query as a Ranger-authenticated user and
@@ -303,13 +322,17 @@ dashboard-driven query.
 
 ## Retention
 
-- **Hot (OpenSearch)**: 30 days per index, then deleted. Change
+- **Hot (OpenSearch)**: 7 days per index, then deleted. Change
   `min_index_age` in `ism-policies/*.json` to adjust.
-- **Raw landing (MinIO)**: Object Lock GOVERNANCE mode, 365-day default
-  retention; lifecycle rule expires objects after 2555 days (~7 years).
-  Adjust in `minio/create-audit-bucket-job.yaml` to match your actual
-  compliance requirement -- these are placeholder defaults, not derived
-  from any stated policy.
+- **Raw landing (MinIO, `audit-logs-raw`)**: 30 days, but only once a file
+  is *also* confirmed merged into Iceberg in that same job run -- deletion
+  is app-level (`spark/iceberg_archive_job.py`), not a bucket lifecycle
+  rule, and there's deliberately no Object Lock on this bucket (see
+  `ARCHITECTURE.md`'s "Raw landing retention" section for why an earlier
+  Object-Lock'd bucket, `audit-logs-cold`, had to be replaced rather than
+  reconfigured -- its files are legacy, draining on their own 365-day
+  locks, untouched by anything now). Change `MIN_AGE_SECONDS_BEFORE_DELETE`
+  in `iceberg_archive_job.py` to adjust the 30-day floor.
 - **Cold, queryable (Iceberg)**: never expired by anything in this
   pipeline. Add a retention job of your own (e.g. an Iceberg `expire
   snapshots` / delete-old-partitions call) if data needs to age out of the

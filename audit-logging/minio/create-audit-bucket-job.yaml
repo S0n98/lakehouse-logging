@@ -1,5 +1,13 @@
-# One-shot Job that provisions the cold-archive bucket on the existing
-# `myminio` tenant:
+# LEGACY -- do not reapply. This bucket (`audit-logs-cold`) is no longer
+# where Fluent Bit lands raw JSON; see ../ARCHITECTURE.md and
+# create-audit-raw-bucket-job.yaml for why. Kept only because the bucket
+# still holds real historical raw files under Object Lock, draining
+# naturally on their original 365-day GOVERNANCE retention -- nothing
+# reads or writes this bucket going forward. This file is history, not an
+# install step.
+#
+# Original purpose, for context: One-shot Job that provisions the
+# cold-archive bucket on the existing `myminio` tenant:
 #   - Object Lock enabled at creation (required for WORM retention; cannot be
 #     added to an existing bucket later)
 #   - Versioning enabled explicitly (Object Lock implies it, kept for clarity)
@@ -7,6 +15,11 @@
 #     COMPLIANCE mode, to match your actual regulatory requirement
 #   - Lifecycle rule: expire objects after 2555 days (~7 years) -- adjust to
 #     your actual regulatory retention requirement
+#
+# This turned out to conflict with actually wanting raw files deleted once
+# confirmed archived: GOVERNANCE-mode retention rejects plain deletes, and
+# Object Lock can't be removed from an existing bucket -- see
+# create-audit-raw-bucket-job.yaml, its replacement, for the fix.
 #
 # Apply: kubectl apply -f create-audit-bucket-job.yaml
 # Then:  kubectl logs -n default job/create-audit-bucket

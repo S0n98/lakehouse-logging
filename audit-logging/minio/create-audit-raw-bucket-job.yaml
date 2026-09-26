@@ -1,0 +1,75 @@
+# One-shot Job that provisions the raw-JSON-landing bucket, `audit-logs-raw`.
+#
+# Deliberately created WITHOUT Object Lock -- unlike `create-audit-bucket-job.yaml`
+# (now legacy, see its header), this bucket's raw files are meant to be
+# deleted by the Spark archival job once confirmed merged into Iceberg AND
+# at least 30 days old (see ../spark/iceberg_archive_job.py). Object Lock
+# would block that entirely (GOVERNANCE-mode retention rejects plain
+# deletes, and it can't be added OR removed after bucket creation -- this
+# is exactly why a new bucket was needed instead of reconfiguring the old
+# one). No lifecycle/ILM rule either: the Spark job IS this bucket's
+# retention mechanism, not a blind age-based bucket policy.
+#
+# Apply: kubectl apply -f create-audit-raw-bucket-job.yaml
+# Then:  kubectl logs -n default job/create-audit-raw-bucket
+#
+# Note: docker.io/minio/mc and quay.io/minio/mc:latest have both returned
+# HTTP 401 on anonymous pulls at different points during this project --
+# if this job's image pull fails, create the bucket directly instead
+# (boto3's `create_bucket(Bucket="audit-logs-raw")` with no
+# `ObjectLockEnabledForBucket` argument, or any S3 client, works equally
+# well and needs no extra image at all).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: create-audit-raw-bucket
+  namespace: default
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: mc
+          image: quay.io/minio/mc:latest
+          env:
+            - name: MC_ENDPOINT
+              value: "http://myminio-hl.default.svc.cluster.local:9000"
+            - name: MC_BUCKET
+              value: "audit-logs-raw"
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: awsAccessKeyId
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: awsSecretAccessKey
+          command: ["/bin/sh", "/scripts/setup.sh"]
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+      volumes:
+        - name: script
+          configMap:
+            name: create-audit-raw-bucket-script
+            defaultMode: 0755
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: create-audit-raw-bucket-script
+  namespace: default
+data:
+  setup.sh: |
+    set -e
+    mc alias set audit-minio "$MC_ENDPOINT" "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
+
+    if ! mc ls audit-minio/"$MC_BUCKET" >/dev/null 2>&1; then
+      mc mb audit-minio/"$MC_BUCKET"
+      echo "bucket created, no Object Lock"
+    else
+      echo "bucket already exists, skipping creation"
+    fi

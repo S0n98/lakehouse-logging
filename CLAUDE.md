@@ -313,3 +313,28 @@ Full writeup and the workaround (route everything through the existing
 comment. **Don't add a new `http` input to fluent-bit for anything without
 re-testing this first** — it may get fixed in a future fluent-bit version,
 but don't assume it has been.
+
+## MinIO Object Lock is a one-way door -- decide retention *before* creating the bucket
+
+Object Lock (`mc mb --with-lock`, or `create_bucket` with
+`ObjectLockEnabledForBucket=True`) can only be set **at bucket creation**.
+It cannot be added to an existing bucket, and — this is the part that
+actually bit us — **it cannot be removed either**, ever, for the life of
+that bucket. Confirmed live 2026-09-26 via boto3's
+`get_object_lock_configuration` and a real object's `head_object`
+(`ObjectLockMode: GOVERNANCE`, a genuine `ObjectLockRetainUntilDate` a year
+out) when a design that had assumed "we can just stop enforcing this
+later" turned out to be structurally impossible — GOVERNANCE-mode
+retention rejects a plain delete outright unless the caller has
+`s3:BypassGovernanceRetention`, and there's no config change, bucket
+policy, or admin override that lifts the lock itself.
+
+If a bucket is ever going to need app-managed deletion (a retention job,
+a cleanup script, anything other than "this data lives here forever") —
+**do not create it with Object Lock**, even if that seems like the safer
+default at the time. The fix when this goes wrong isn't a settings change,
+it's a new bucket and a migration (see `audit-logging/ARCHITECTURE.md`'s
+"Raw landing retention" section for exactly this happening to
+`audit-logs-cold` -> `audit-logs-raw`, and
+`audit-logging/minio/create-audit-raw-bucket-job.yaml` for the
+lock-free replacement).
