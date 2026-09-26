@@ -314,6 +314,31 @@ comment. **Don't add a new `http` input to fluent-bit for anything without
 re-testing this first** — it may get fixed in a future fluent-bit version,
 but don't assume it has been.
 
+## PVC `size:` fields are not enforced on this cluster -- everything shares one disk
+
+Confirmed directly 2026-09-26 while sizing the audit-logging stack: both
+storage classes in use (`nfs-client`, and `local-minio`) resolve to the
+**same single physical disk** (`/dev/mapper/ubuntu--vg-ubuntu--lv`, 146G),
+and neither enforces the PVC's declared `size:` as a real quota.
+
+- OpenSearch's PVC claims `100Gi`; `df` inside the pod reports the host's
+  actual 146G/~125G-used/~14G-avail, not 100Gi — because the `nfs-client`
+  storage class's backing NFS server is this same host (see "Node IP" above).
+- MinIO's PVC claims `500Gi` (bigger than the entire physical disk); same
+  `df` output, same reason — the `local-minio` storage class is a
+  hostPath-style local PV into the same disk, also unenforced.
+
+**`du` inside the pod, not `df`, is the only way to see a component's
+real data size** on this cluster (confirmed: OpenSearch's PVC showed 91%
+"used" via `df` while its actual data directory was 19MB via `du` — the
+"used" was everything else on the host, not OpenSearch's data). When
+sizing anything new, remember every PVC you create is drawing from the
+same shared pool regardless of what size you request — a disk-pressure
+episode caused by one component's data growth affects every other PVC's
+apparent headroom too, since there's really only one disk. See
+`audit-logging/RESOURCE-PLANNING.md` for a worked example of planning
+around this.
+
 ## MinIO Object Lock is a one-way door -- decide retention *before* creating the bucket
 
 Object Lock (`mc mb --with-lock`, or `create_bucket` with

@@ -65,7 +65,11 @@ is working, not just that pods are running -- includes a worked example
 report), **[VIEWING-LOGS.md](VIEWING-LOGS.md)** (how to browse hot-tier
 data in OpenSearch Dashboards and cold-tier data in Superset SQL Lab), and
 **[CAPACITY.md](CAPACITY.md)** (1-year storage estimates by raw event
-volume and by active user count, from measured per-record sizes).
+volume and by active user count, from measured per-record sizes), and
+**[RESOURCE-PLANNING.md](RESOURCE-PLANNING.md)** (CPU/RAM/disk for the
+whole stack over 1 year -- includes a finding worth knowing regardless of
+this pipeline: this cluster's PVCs don't actually enforce their declared
+size, every one of them shares the same physical disk).
 
 ## Architecture in one paragraph
 
