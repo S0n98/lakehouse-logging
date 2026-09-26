@@ -49,8 +49,10 @@ install-guide/ Pulled Helm chart archives + the exact values used, for
 
 Also see **[TESTING.md](TESTING.md)** (how to actually verify each stage
 is working, not just that pods are running -- includes a worked example
-report) and **[VIEWING-LOGS.md](VIEWING-LOGS.md)** (how to browse hot-tier
-data in OpenSearch Dashboards and cold-tier data in Superset SQL Lab).
+report), **[VIEWING-LOGS.md](VIEWING-LOGS.md)** (how to browse hot-tier
+data in OpenSearch Dashboards and cold-tier data in Superset SQL Lab), and
+**[CAPACITY.md](CAPACITY.md)** (1-year storage estimates by raw event
+volume and by active user count, from measured per-record sizes).
 
 ## Architecture in one paragraph
 
