@@ -263,6 +263,41 @@ end-to-end (verified 2026-09-23: real Iceberg tables with Parquet data
 files, registered in Nessie, confirmed via direct REST API + MinIO
 inspection).
 
+## `ScheduledSparkApplication` can silently wedge if the operator restarts at the wrong moment
+
+Found 2026-09-26, testing the audit-logging cold tier: a
+`ScheduledSparkApplication`'s run can complete successfully (driver pod
+`Completed`, logs show real success) but the operator crashing/restarting
+right at that moment can leave the corresponding `SparkApplication` object
+stuck in `PENDING_RERUN` forever. This silently blocks all future
+scheduled runs -- the schedule object itself still reports
+`"scheduleState": "Scheduled"` and looks completely healthy, and
+`kubectl get pods` shows nothing wrong either (the stuck job's driver pod
+is just sitting there `Completed`, same as every other successful run).
+The only way to notice is to check whether the *data* is actually still
+growing (e.g. an Iceberg row count), not the Kubernetes objects.
+
+Diagnose:
+```bash
+kubectl get scheduledsparkapplication <name> -n default -o jsonpath='{.status}' | python3 -m json.tool
+# a `lastRun`/`nextRun` that's days old, with the schedule cron implying
+# it should have fired since, is the tell
+```
+
+Fix -- delete the wedged run, then force a reconcile (deleting the child
+object alone isn't enough; the `ScheduledSparkApplication` controller only
+evaluates whether to submit a new run at each cron tick or on a watch
+event against the *schedule* object itself, not on the child's deletion):
+```bash
+kubectl delete sparkapplication <stuck-run-name> -n default
+kubectl annotate scheduledsparkapplication <name> -n default force-reconcile="$(date +%s)" --overwrite
+```
+A new run should submit within ~15 seconds. This is a genuinely
+destructive-adjacent action (deleting a workload object) -- confirm the
+driver's logs show real prior success first (don't delete a run that
+might still be legitimately in-flight), and get confirmation before
+running it if you're not sure.
+
 ## This cluster's fluent-bit build has a real bug: avoid the `http` input
 
 `cr.fluentbit.io/fluent/fluent-bit:5.0.9` (and confirmed also `3.1.9`) never
