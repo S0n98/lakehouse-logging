@@ -24,5 +24,14 @@ ingress:
     - host: audit-logs.local
       paths:
         - path: /
-          pathType: Prefix
+          # This chart's ingress template needs the backend spelled out
+          # explicitly (old-style, doesn't default to the release's own
+          # service/port the way some other charts' ingress templates do)
+          # -- omitting this fails with a nil-pointer error on
+          # `.backend.serviceName`. Service name matches the helm release
+          # name below (opensearch-dashboards); port 5601 is this chart's
+          # default (see `service.port` in its own values.yaml).
+          backend:
+            serviceName: opensearch-dashboards
+            servicePort: 5601
   tls: []

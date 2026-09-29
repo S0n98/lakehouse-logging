@@ -27,18 +27,36 @@ matters for what you're doing.)
 
 ## Hot tier: OpenSearch Dashboards
 
-**Status on this cluster: not currently installed** -- it's an optional
-step in `README.md` (`helm install opensearch-dashboards ...`) that
-hasn't been run here. Everything below assumes you've run that step
-(ingress host `audit-logs.local`, matching `opensearch/dashboards-values.yaml`).
-If you haven't installed it yet and just need a quick answer right now,
-skip to "No Dashboards? Query OpenSearch directly" below.
+**Status on this cluster: installed 2026-09-29** (ingress host
+`audit-logs.local`, matching `opensearch/dashboards-values.yaml`) -- the
+three index patterns below are already created, so you can skip straight
+to "Browsing: the Discover tab" after logging in.
 
-### One-time setup: index patterns
+One thing worth knowing if you ever reinstall this: the chart's
+`ingress.hosts[].paths[].backend` needs `serviceName`/`servicePort`
+spelled out explicitly (`opensearch-dashboards` / `5601`) -- this chart's
+ingress template doesn't default to the release's own service the way
+some others do, and omitting it fails with a nil-pointer error on
+`.backend.serviceName`. Already fixed in `dashboards-values.yaml`.
+
+Also hit, and fixed, a persistent `cluster.blocks.create_index: true`
+setting on the OpenSearch cluster that blocked Dashboards from creating
+its own `.kibana` saved-objects index on first connect -- not something
+this repo's own provisioning ever sets, so it was very likely a leftover
+from earlier ad-hoc disk-pressure firefighting that never got reverted.
+Cleared via `PUT _cluster/settings {"persistent": {"cluster.blocks.create_index": null}}`.
+If a future Dashboards install (or anything else needing to create an
+index) fails the same way, check `GET _cluster/settings?flat_settings=true`
+for this before assuming it's a fresh problem.
+
+### One-time setup: index patterns (already done on this cluster)
 
 Each audit source writes to a **daily** index (`ranger_audits-2026.09.26`,
 etc. -- see `Logstash_DateFormat` in `fluent-bit/values.yaml`), so use a
-wildcard pattern to see all of a source's history:
+wildcard pattern to see all of a source's history. Already created via the
+saved objects API for `ranger_audits-*`, `trino_query_audit-*`, and
+`superset_audit-*` (time field `event_time` on all three) -- steps below
+are for reference / reinstalling elsewhere:
 
 1. Open `http://audit-logs.local`, log in (default `admin` / the same
    password as the OpenSearch cluster -- see `opensearch/values.yaml`'s
