@@ -140,20 +140,22 @@ longer accumulating past 30 days.
 
 ---
 
-## Two things to fix that affect these numbers
+## One thing already fixed, one still open
 
-1. **OpenSearch field-mapping explosion.** The `trino_query_audit` index
-   alone has **606 distinct mapped fields**, almost entirely from
-   Kubernetes pod annotation keys (`checksum/catalog-config`,
-   `cni.projectcalico.org/podIP`, etc.) that the `kubernetes` filter
-   merges in — dynamic mapping then creates both a `text` and `.keyword`
-   sub-field for each, with zero audit value. The 1.3x overhead multiplier
-   above assumes this gets fixed (an index template with `"dynamic":
-   false` on the `kubernetes.annotations` subtree, or dropping that
-   subtree in Fluent Bit before indexing) — **without that fix, hot tier
-   could run meaningfully higher than these numbers**, and there's a real
-   risk of hitting OpenSearch's default 1000-field-per-index limit as more
-   distinct pods/checksums appear over time.
+1. **OpenSearch field-mapping explosion — fixed 2026-09-29.** The
+   `trino_query_audit` index had ballooned to **620 distinct mapped
+   fields**, almost entirely from Kubernetes pod annotation keys
+   (`checksum/catalog-config`, `cni.projectcalico.org/podIP`, etc.) that
+   the `kubernetes` filter merged in — dynamic mapping then created both a
+   `text` and `.keyword` sub-field for each, with zero audit value. Fixed
+   with a `lua` filter (`fluent-bit/values.yaml`'s `luaScripts`) that
+   strips `kubernetes.annotations` right after the `kubernetes` filter,
+   before any per-source split — benefits the raw-landing/Iceberg copy too
+   (smaller `raw_json`), not just OpenSearch. Verified live: a fresh index
+   created after the fix (`trino_query_audit-2026.09.29`) has **75
+   fields**, down from 620 on the pre-fix indices. The 1.3x hot-tier
+   overhead multiplier in the formulas above assumed this fix — it's now
+   accurate rather than optimistic.
 2. **`security-auditlog-*` has no ISM policy at all** (confirmed via
    `_plugins/_ism/explain/security-auditlog-*`) — OpenSearch's own
    internal security-plugin audit log, unrelated to the 3-source design

@@ -73,6 +73,25 @@ config:
         K8S-Logging.Parser  On
         K8S-Logging.Exclude On
 
+    # Strips kubernetes.annotations before anything downstream sees it --
+    # fixes a real problem found 2026-09-29: the annotations map (checksum/*
+    # config hashes, CNI pod/container IDs, etc.) has zero audit value but
+    # was making OpenSearch dynamically map every distinct annotation key as
+    # its own field (620+ mapped fields on trino_query_audit alone, with a
+    # text + .keyword sub-field each) -- real risk of hitting OpenSearch's
+    # default 1000-field-per-index limit as more pods/checksums appear over
+    # time, on top of the storage overhead. Placed right after the
+    # `kubernetes` filter and before the rewrite_tag splits below so it
+    # applies once to every kube.* record, benefiting all three audit
+    # sources' opensearch output AND shrinking the raw_json landed in the
+    # s3 output / Iceberg cold tier -- not just an OpenSearch-side fix.
+    # See RESOURCE-PLANNING.md and CAPACITY.md for the finding this closes.
+    [FILTER]
+        Name    lua
+        Match   kube.*
+        script  /fluent-bit/scripts/strip_k8s_annotations.lua
+        call    strip_annotations
+
     [FILTER]
         Name          rewrite_tag
         Match         kube.*
@@ -253,6 +272,19 @@ config:
     [PARSER]
         Name    json_decode
         Format  json
+
+# Used by the lua filter in the filters block above -- see its comment for
+# why this exists (OpenSearch field-mapping explosion from unfiltered
+# Kubernetes annotations).
+luaScripts:
+  strip_k8s_annotations.lua: |
+    function strip_annotations(tag, timestamp, record)
+        if record["kubernetes"] ~= nil and record["kubernetes"]["annotations"] ~= nil then
+            record["kubernetes"]["annotations"] = nil
+            return 1, timestamp, record
+        end
+        return 0, timestamp, record
+    end
 
 resources:
   requests:

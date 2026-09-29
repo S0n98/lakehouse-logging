@@ -34,6 +34,14 @@ dynamic-partition-overwrite write to an idempotent `MERGE INTO` keyed on
 possible at all -- see `ARCHITECTURE.md`'s "Raw landing retention" section
 for the full reasoning.
 
+**Updated 2026-09-29: fixed an OpenSearch field-mapping explosion**
+(`trino_query_audit` had reached 620 mapped fields from unfiltered
+Kubernetes pod annotations, found while writing `CAPACITY.md`/
+`RESOURCE-PLANNING.md`) -- a `lua` filter now strips
+`kubernetes.annotations` before indexing, verified live (a fresh index
+dropped to 75 fields). See `ARCHITECTURE.md`'s "Bugs found and fixed
+during rollout" (#4) for the full writeup.
+
 ## What's here
 
 ```

@@ -295,6 +295,29 @@ to re-verify against: a synthetic test payload matching your own
 assumptions about the schema proves nothing about whether the real
 upstream service's actual output matches those assumptions.
 
+**4. (2026-09-29) OpenSearch field-mapping explosion, found while sizing
+disk/RAM for `CAPACITY.md`/`RESOURCE-PLANNING.md`.** Unlike the three
+above, this one wasn't silent -- data was arriving and fully queryable --
+but the `kubernetes` filter's `Merge_Log` was pulling in the full
+Kubernetes pod annotation map (`checksum/catalog-config`,
+`cni.projectcalico.org/podIP`, etc.) on every record, and OpenSearch's
+dynamic mapping turned each distinct annotation key into its own mapped
+field (a `text` and a `.keyword` sub-field each). `trino_query_audit` had
+reached **620 mapped fields** for what's really a handful of meaningful
+audit fields -- real RAM/storage overhead today, and a real risk of
+hitting OpenSearch's default 1000-field-per-index limit (and getting
+documents rejected outright) as more pods/deployments introduce new
+annotation keys over time. Fixed with a `lua` filter
+(`fluent-bit/values.yaml`'s `luaScripts`) that deletes
+`kubernetes.annotations` right after the `kubernetes` filter, before any
+per-source `rewrite_tag` split -- so it benefits all three sources'
+OpenSearch mapping *and* shrinks the `raw_json` landed in MinIO/Iceberg,
+not just one tier. Verified live: a fresh index created after the fix
+(`trino_query_audit-2026.09.29`) mapped **75 fields**, and a document
+indexed after the fix confirmed `kubernetes.annotations` genuinely absent
+while every other `kubernetes.*` field (`pod_id`, `labels`,
+`container_name`, etc.) was still present and correct.
+
 ## Retention model
 
 | Tier | Store | Duration | Mechanism |

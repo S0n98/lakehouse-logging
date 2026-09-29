@@ -101,13 +101,14 @@ this specific cluster:
 | 1,000,000 | 19.1 GB | ~1.27 GB | Current 1.5GB heap is now close to the rule-of-thumb floor — bump to ~2GB heap / 4-6Gi container |
 | 10,000,000 | 191 GB | ~12.7 GB | **Needs a real multi-node OpenSearch cluster.** A single pod on this single-node host cannot host a 12.7GB heap alongside everything else this host runs (see `CLAUDE.md`'s chronic disk/memory constraints) — this volume is genuinely beyond what this cluster's architecture supports as-is. |
 
-**This ignores `CAPACITY.md`'s field-mapping-explosion finding** (606
-mapped fields on `trino_query_audit` from unfiltered Kubernetes
-annotations) — if that's not fixed, real heap pressure will be
-meaningfully worse than this table implies at every scale, since mapped
-field count (not just document count) drives a real share of OpenSearch's
-memory overhead. Fix that first before using this table to justify a
-bigger allocation.
+This table assumes `CAPACITY.md`'s field-mapping-explosion finding is
+fixed — **it is, as of 2026-09-29** (a `lua` filter now strips
+`kubernetes.annotations` before indexing; verified live, a fresh index
+dropped from 620 mapped fields to 75). Before that fix, real heap
+pressure would have been meaningfully worse than this table implies at
+every scale, since mapped field count (not just document count) drives a
+real share of OpenSearch's memory overhead — this table is only accurate
+because that's no longer the case.
 
 ### Fluent Bit: stays lightweight across the whole range
 
@@ -231,7 +232,8 @@ real multi-node deployment, not just a bigger single pod.
 - This doc assumes `CAPACITY.md`'s BI-workload assumptions (15
   queries/user/day, etc.) — if those don't match your real usage, redo
   both docs' numbers together, they're meant to stay consistent.
-- Fixing the OpenSearch field-mapping explosion (drop/disable dynamic
-  mapping on `kubernetes.annotations`) matters more to real RAM headroom
-  than anything in this doc's scaling tables — do that before relying on
-  the heap-sizing guidance above.
+- The OpenSearch field-mapping explosion (dynamic mapping on
+  `kubernetes.annotations`) mattered more to real RAM headroom than
+  anything else in this doc's scaling tables — it's fixed now (see
+  Section 2), which is what makes the heap-sizing guidance above
+  trustworthy rather than optimistic.
