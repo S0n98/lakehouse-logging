@@ -113,6 +113,15 @@ install, which is easy to miss if you only check the Helm charts.
 
 ### 1. Container images
 
+**`download-images.sh` automates pulling and saving every image below**
+(as `.tar` files, ready to transfer) -- run it on a machine with internet
+access, then transfer its output directory and `ctr ... images import`
+each file on the air-gapped cluster (exact command in the script's own
+header). It can't fetch the two custom, local-only images for you
+(`opensearch-with-s3`, `superset-ldap`) -- it saves them if they already
+exist in this host's Docker store, and tells you clearly if not, per the
+table below.
+
 **Every image below is needed for the full working system, not just the
 audit-logging additions** -- the audit pipeline doesn't run standalone,
 it sits on top of an existing Trino/Superset/Ranger/Nessie/MinIO
