@@ -162,13 +162,17 @@ longer accumulating past 30 days.
    here, growing completely unbounded on the same disk budget. Not
    included in any number above. Either add a 4th ISM policy for it, or
    explicitly decide it's out of scope and size for it separately.
-3. **Iceberg itself still has no expiration or snapshot-cleanup job.**
-   It's the one tier that's supposed to grow forever by design, but even
-   an intentionally-unbounded table needs periodic `expire_snapshots` /
-   orphan-file cleanup as routine maintenance (old snapshots and their
-   superseded data files otherwise pile up as dead weight on top of the
-   live data) — not addressed by anything in this doc or the recent
-   retention redesign.
+3. **File compaction is now automated (2026-10-01); snapshot
+   expiry/orphan cleanup deliberately isn't.** A daily job now runs
+   `rewrite_data_files` on all three tables — fixing the small-file
+   overhead problem measured above going forward. `expire_snapshots` and
+   `remove_orphan_files` are a different story: both are blocked via
+   Spark by a Nessie GC safety guard, and orphan-file cleanup is left as
+   a deliberate manual-via-Trino operation instead (see
+   `ARCHITECTURE.md`'s "Cold tier maintenance" section) rather than
+   adding Trino credentials to an automated job for one procedure. Iceberg
+   is still the one tier that grows forever by design — this is about
+   *file-level* housekeeping on top of that, not data retention.
 
 ## Recomputing with your own numbers
 

@@ -173,6 +173,147 @@ via a dynamic partition overwrite and never deleted raw files at all,
 relying on the bucket's Object Lock for immutability instead of
 application logic. See "Raw landing retention" below for why that changed.)
 
+## Table structure: promoted columns, not one opaque JSON blob
+
+Redesigned 2026-10-01, prompted by exactly the kind of forensic question
+this pipeline exists to answer -- "which queries did user X run on date
+Y", "when was table Z queried" -- being slow and awkward against the
+original schema. The original design kept every table down to four
+columns (`record_id`, `event_date`, `event_time`, `raw_json`), with every
+real field (user, SQL text, tables touched, Ranger's access decision...)
+buried inside `raw_json`'s undifferentiated JSON string. That meant every
+such query had to fully scan and JSON-parse every row in the matching
+partition -- no column could help Trino skip a file, because nothing
+except the date was a real column.
+
+Each table now promotes its commonly-filtered fields to real, typed
+columns, while keeping `raw_json` as a forensic catch-all for everything
+else:
+
+```sql
+-- iceberg.audit.ranger_audit
+record_id, event_date, event_time,
+req_user, access_type, resource, resource_type, repo, result, req_data,
+raw_json
+
+-- iceberg.audit.trino_query_audit
+record_id, event_date, event_time,
+user_name, source, remote_address, query_id, query_state, query_text,
+tables ARRAY<STRUCT<catalog, schema, table>>,   -- native nested type, not a JSON string
+raw_json
+
+-- iceberg.audit.superset_audit
+record_id, event_date, event_time,
+user_id, action, dashboard_id, slice_id, duration_ms,
+raw_json
+```
+
+Why this split, not a fully flattened schema or a separate table per
+field: the fields promoted are exactly the ones queried directly (see the
+query cookbook in `README.md`); everything else -- the long tail of each
+source's payload, which keeps drifting as Ranger/Trino/Superset versions
+change -- stays in `raw_json`, so adding a field a source starts emitting
+tomorrow needs zero schema migration. `tables` is the one exception worth
+calling out: Trino's payload already carries it as a real array of
+structured per-table references (catalog/schema/table/columns/etc, not a
+flat string), and Iceberg/Parquet support nested array-of-struct columns
+natively -- modeling it as a native `ARRAY<STRUCT<...>>` column (rather
+than a separate bridge/join table, the traditional relational-normalization
+move) keeps it queryable with a plain `UNNEST`, no JSON parsing, and
+fits how analytical/audit tables are normally modeled in a lakehouse
+(wide and denormalized, not joined).
+
+**Extraction happens via `get_json_object(raw_json, '$.path')`, not
+native nested field access on the DataFrame Spark infers from the raw
+JSON** -- deliberately, and for a real reason, not just backfill
+convenience. Spark's JSON schema inference only includes fields actually
+present in *that run's* batch of files; a field that's a normal part of
+the payload but happens to be absent from every record in one particular
+(small) batch would make native access (`df["field"]`) throw an
+`AnalysisException` that run. Extracting from the already-serialized
+`raw_json` string is immune to that -- a missing path just evaluates to
+NULL, exactly the semantics an optional/sparse field should have. The
+same expressions are reused for the one-time backfill of
+already-archived rows (`UPDATE ... SET col = get_json_object(raw_json,
+'$.path') WHERE col IS NULL`), so there's one canonical extraction rule
+per field, not two that could drift apart.
+
+**Sort order:** each table is `WRITE ORDERED BY` its single most
+commonly filtered column (`req_user`, `user_name`, `user_id`
+respectively). This is what makes Parquet's per-file min/max statistics
+actually useful for pruning -- without it, every file in a partition
+could contain any value for that column, so none can be skipped;
+clustering matching rows together in the same files at write time is
+what lets a filter on that column skip files, not just the already-there
+day-level partition pruning.
+
+**Verified live, not just deployed** (2026-10-01): schema migration +
+backfill ran cleanly against all three already-populated tables; a hit
+from a real bug during this (the backfill's integer columns weren't cast
+-- `get_json_object` always returns `STRING`, and `UPDATE ... SET result
+= get_json_object(...)` into an `INT` column failed with
+`CANNOT_SAFELY_CAST`, caught and fixed by explicitly casting backfill
+expressions for `INT`-typed columns, matching what the live-write path
+already did); re-tested all three sources end-to-end afterward with zero
+new duplicates from two mid-test retries (`GROUP BY record_id HAVING
+count(*) > 1` found only the one pre-existing duplicate already documented
+below, nothing new); confirmed the new `tables` column is natively
+queryable with a plain `UNNEST`, no JSON functions needed.
+
+**A real, separate bug this surfaced, found because it was previously
+invisible:** promoting `req_user` to a real column made it obvious that
+7 of 255 `ranger_audit` rows had `req_user IS NULL` -- not a gap in the
+new redesign, but a *pre-existing* false-positive in the Ranger
+`rewrite_tag` rule in `fluent-bit/values.yaml`, which matched on the bare
+substring `"repoType"` in raw log text. That substring also appears in
+Spark's own internal query-plan debug output (e.g. a Catalyst column
+reference printed as `repoType#68L`, with no surrounding quotes or
+colon) whenever this very archival job's own driver logs its plan while
+processing ranger data -- fluent-bit's `tail` input picks that line back
+up like any other pod's logs, and the loose match miscategorized it as a
+real Ranger audit event. Fixed by tightening the rule to match the
+literal JSON key-colon form `"repoType":` instead of the bare substring
+(confirmed via `SHOW CREATE TABLE`/raw samples that this is exactly how
+the string appears in genuine Ranger audit JSON, and never how Spark's
+debug output renders it). The 7 already-affected historical rows are left
+as-is -- harmless, and now trivially findable via `WHERE req_user IS
+NULL` precisely because the redesign gave the field a real column instead
+of leaving it invisible inside `raw_json`.
+
+## Cold tier maintenance: compaction, and why orphan-file cleanup stays manual
+
+A daily `ScheduledSparkApplication` (`audit-iceberg-maintenance`,
+`spark/iceberg_maintenance_job.py`) runs `CALL iceberg.system.
+rewrite_data_files(...)` against all three tables -- compaction of the
+many small files this pipeline's low-volume, hourly-incremental writes
+naturally produce (see `CAPACITY.md`'s file-count-overhead finding) into
+properly-sized ones. Deliberately separate from the hourly archival jobs
+-- compaction is expensive relative to an incremental load and doesn't
+need to run every hour.
+
+**`remove_orphan_files` and `expire_snapshots` are deliberately NOT part
+of this automated job**, for a real, tested reason: both fail via Spark
+with "GC is disabled (deleting files may corrupt other tables)" -- this
+REST catalog (Nessie)'s own safety guard, since Nessie tracks its own
+commit/branch/tag history independent of Iceberg's native snapshot list,
+and blindly deleting files out from under it risks breaking a Nessie
+reference that still points to one. Interestingly, **Trino's Iceberg
+connector does NOT enforce this guard for `remove_orphan_files`**
+specifically (only for `expire_snapshots`) -- confirmed live, `ALTER
+TABLE ... EXECUTE remove_orphan_files(retention_threshold => '7d')` via
+Trino found and removed 120 real orphan files with zero error, arguably
+the more correct behavior (a genuinely orphaned file, referenced by no
+current manifest at all, can't belong to a live Nessie reference
+either). Rather than add Trino credentials to an automated job just to
+call the one procedure Spark won't allow, orphan-file cleanup is left as
+a periodic **manual** operation -- run the command above per table,
+from `psql`/`superset shell`/anywhere with Trino access, when storage
+actually warrants it; this cluster's current data volumes don't justify
+automating it yet. Snapshot expiry stays blocked everywhere, by design
+-- see the module docstring in `iceberg_maintenance_job.py` for the full
+reasoning; this isn't a gap to eventually close, it's deferring correctly
+to Nessie's own garbage-collection model instead of overriding it.
+
 Two non-obvious things had to be worked out to make this run at all, both
 already reflected in `scheduled-spark-application.yaml`:
 

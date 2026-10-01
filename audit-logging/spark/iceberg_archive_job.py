@@ -1,7 +1,7 @@
 """
 Cold-tier audit archiver: reads the raw NDJSON audit files Fluent Bit lands
 in MinIO (see ../fluent-bit/values.yaml -- the "audit_source" s3 outputs)
-and loads them into a real Iceberg table under the existing `lakehouse`
+and loads them into real Iceberg tables under the existing `lakehouse`
 warehouse / Nessie catalog, the same catalog Trino already queries. Once
 this runs, the data is queryable from Trino with plain SQL:
 
@@ -10,74 +10,127 @@ this runs, the data is queryable from Trino with plain SQL:
 Run once per source (ranger / trino / superset) via the source arg -- see
 scheduled-spark-application.yaml, one ScheduledSparkApplication per source.
 
-RAW LANDING ZONE RETENTION -- read this before changing the delete logic:
-raw files are kept for at least 30 days, then deleted, but ONLY once BOTH
-of these hold:
-  1. The file has been successfully merged into Iceberg (confirmed within
-     THIS SAME run, immediately before deletion -- never assumed from a
-     past run).
-  2. The file is at least 30 days old (Hadoop FileStatus modification
-     time), giving a real recovery window if a bug in this job's own
-     transform logic ever silently corrupts/loses data despite the write
-     technically succeeding.
+TABLE DESIGN -- redesigned 2026-10-01 for real partition/file pruning:
+each source's commonly-filtered fields (see SOURCE_CONFIG below -- the
+user, the SQL text, which tables got touched, etc.) are promoted to real,
+typed top-level columns instead of being buried inside one opaque JSON
+string. `raw_json` is kept on every table as a forensic catch-all for
+every field NOT promoted -- so nothing is lost for a source's long tail
+of fields, and a source's payload shape can keep drifting without a
+schema migration every time, but the fields people actually filter on
+(see ../ARCHITECTURE.md's query cookbook) get real column statistics,
+not a full-partition JSON scan.
 
-This design replaced an earlier one (see git history) that never deleted
-raw files at all, relying on the `audit-logs-cold` bucket's Object Lock
-(WORM, GOVERNANCE, 365d) for immutability. That bucket's Object Lock
-config turned out to structurally block ANY early deletion regardless of
-what this job does (GOVERNANCE-mode retention rejects plain deletes, and
-Object Lock cannot be removed from a bucket once enabled at creation) --
-confirmed live via `get_object_lock_configuration` /
-`head_object`'s `ObjectLockRetainUntilDate` before this rewrite. Raw
-landing now lands in a NEW bucket, `audit-logs-raw`, created without
-Object Lock specifically so this job can manage its own retention. The
-old `audit-logs-cold` bucket's files are untouched legacy data, draining
-naturally on their original 365-day locks -- see ../ARCHITECTURE.md.
+Promoted columns are extracted via `get_json_object(raw_json, '$.path')`,
+not native nested field access on the DataFrame Spark infers from the raw
+JSON -- deliberately. Spark's JSON schema inference only includes fields
+actually present in THIS run's batch of files; a field genuinely missing
+from every record in one run's (small) batch would make native access
+(`df["field"]`) throw an AnalysisException that run, even though the
+field is a normal, expected part of the payload. Extracting from the
+already-serialized `raw_json` string is immune to that -- a missing path
+just evaluates to NULL, exactly the semantics a sparse/optional field
+should have.
 
-IDEMPOTENCY -- because raw files now stick around for up to 30 days (not
-deleted immediately after their first successful merge), and because a
-retry after a partial failure must not double-insert, every record is
-identified by `record_id` = sha256(raw_json). Writes go through Iceberg's
-MERGE INTO (WHEN NOT MATCHED THEN INSERT), so re-merging an
-already-present record -- whether it's the same file re-read on a later
-run because it's not 30 days old yet, or a retry after a crash between a
-successful commit and the delete step -- is always a safe no-op, never a
-duplicate.
+IDEMPOTENCY -- unchanged from the previous design: every record is
+identified by `record_id` = sha256(raw_json), and writes go through
+Iceberg's MERGE INTO (WHEN NOT MATCHED THEN INSERT), so re-merging an
+already-present record is always a safe no-op.
 
-Every run reads the FULL raw prefix for the source, same as before (no
-watermark) -- with a real backlog of up to 30 days now living there
-between deletions, this reprocesses more data per run than the old
-delete-immediately design would have, which is the deliberate cost of the
-30-day recovery window. At this cluster's data volumes that's not a
-concern; revisit (a real incremental/watermarked read) if it ever
-becomes one -- see ../README.md "Known gaps".
+RAW LANDING ZONE RETENTION -- unchanged: raw files are deleted once
+confirmed merged into Iceberg AND at least 30 days old. See
+../ARCHITECTURE.md's "Raw landing retention" section for the full
+reasoning (and why this bucket deliberately has no Object Lock).
+
+MAINTENANCE -- compaction (`ALTER TABLE ... EXECUTE optimize`) and orphan
+file cleanup (`EXECUTE remove_orphan_files`) run separately, daily, via
+../spark/iceberg-maintenance-cronjob.yaml -- NOT in this job, since
+compaction is expensive relative to an hourly incremental load and
+doesn't need to run that often. See that file's header for why
+`expire_snapshots` is deliberately NOT part of maintenance here (a
+Nessie-specific GC safety guard, not an oversight).
 """
 import sys
 import time
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-
-SOURCE_TABLES = {
-    "ranger": "ranger_audit",
-    "trino": "trino_query_audit",
-    "superset": "superset_audit",
-}
+from pyspark.sql.types import ArrayType, StringType, StructField, StructType
 
 MIN_AGE_SECONDS_BEFORE_DELETE = 30 * 24 * 60 * 60  # 30 days
 
+TABLES_ARRAY_SCHEMA = ArrayType(StructType([
+    StructField("catalog", StringType()),
+    StructField("schema", StringType()),
+    StructField("table", StringType()),
+]))
+
+# Per-source: the table name, the extra promoted columns (name, Spark SQL
+# type, JSON path into raw_json), and which column to sort written data by
+# -- sorting data by the field it's most commonly filtered on clusters
+# matching rows together within a file, which is what makes Parquet's
+# per-file min/max stats actually useful for skipping files at query time
+# (without this, every file in a partition looks like it might contain any
+# value, so none can be skipped).
+SOURCE_CONFIG = {
+    "ranger": {
+        "table": "ranger_audit",
+        "columns": [
+            ("req_user", "STRING", "$.reqUser"),
+            ("access_type", "STRING", "$.access"),
+            ("resource", "STRING", "$.resource"),
+            ("resource_type", "STRING", "$.resType"),
+            ("repo", "STRING", "$.repo"),
+            ("result", "INT", "$.result"),
+            ("req_data", "STRING", "$.reqData"),
+        ],
+        "sort_column": "req_user",
+    },
+    "trino": {
+        "table": "trino_query_audit",
+        "columns": [
+            ("user_name", "STRING", "$.context.user"),
+            ("source", "STRING", "$.context.source"),
+            ("remote_address", "STRING", "$.context.remoteClientAddress"),
+            ("query_id", "STRING", "$.metadata.queryId"),
+            ("query_state", "STRING", "$.metadata.queryState"),
+            ("query_text", "STRING", "$.metadata.query"),
+            # tables is handled separately below -- it's an array of
+            # structs (catalog/schema/table per referenced table), not a
+            # scalar get_json_object path.
+        ],
+        "sort_column": "user_name",
+    },
+    "superset": {
+        "table": "superset_audit",
+        "columns": [
+            ("user_id", "INT", "$.user_id"),
+            ("action", "STRING", "$.action"),
+            ("dashboard_id", "INT", "$.dashboard_id"),
+            ("slice_id", "INT", "$.slice_id"),
+            ("duration_ms", "INT", "$.duration_ms"),
+        ],
+        "sort_column": "user_id",
+    },
+}
+
 
 def main(source: str) -> None:
-    if source not in SOURCE_TABLES:
-        raise SystemExit(f"unknown source {source!r}, expected one of {list(SOURCE_TABLES)}")
+    if source not in SOURCE_CONFIG:
+        raise SystemExit(f"unknown source {source!r}, expected one of {list(SOURCE_CONFIG)}")
 
-    table_name = SOURCE_TABLES[source]
+    config = SOURCE_CONFIG[source]
+    table_name = config["table"]
     raw_path = f"s3a://audit-logs-raw/raw/{source}/"
     table = f"iceberg.audit.{table_name}"
+    has_tables_column = source == "trino"
 
     spark = SparkSession.builder.appName(f"audit-archive-{source}").getOrCreate()
 
     spark.sql("CREATE NAMESPACE IF NOT EXISTS iceberg.audit")
+
+    promoted_cols_ddl = ",\n            ".join(f"{name} {sql_type}" for name, sql_type, _ in config["columns"])
+    tables_col_ddl = ",\n            tables ARRAY<STRUCT<catalog: STRING, schema: STRING, table: STRING>>" if has_tables_column else ""
 
     spark.sql(f"""
         CREATE TABLE IF NOT EXISTS {table}
@@ -85,24 +138,55 @@ def main(source: str) -> None:
             record_id  STRING,
             event_date DATE,
             event_time TIMESTAMP,
+            {promoted_cols_ddl}{tables_col_ddl},
             raw_json   STRING
         )
         USING iceberg
         PARTITIONED BY (event_date)
     """)
 
-    # Schema migration for tables created before record_id existed (this
-    # cluster's tables were -- see git history). Safe to run every time:
-    # Iceberg errors if the column already exists, deliberately ignored.
+    # Schema migration for tables created before these columns existed --
+    # safe to run every time, Iceberg errors (caught below) if a column
+    # already exists.
+    for name, sql_type, _ in config["columns"]:
+        try:
+            spark.sql(f"ALTER TABLE {table} ADD COLUMNS ({name} {sql_type})")
+        except Exception:
+            pass  # already has the column
+    if has_tables_column:
+        try:
+            spark.sql(f"ALTER TABLE {table} ADD COLUMNS (tables ARRAY<STRUCT<catalog: STRING, schema: STRING, table: STRING>>)")
+        except Exception:
+            pass
     try:
         spark.sql(f"ALTER TABLE {table} ADD COLUMNS (record_id STRING)")
-        print(f"[{source}] migrated {table}: added record_id column")
     except Exception:
-        pass  # already has the column
+        pass
 
-    # Idempotent/cheap to run every time -- backfills any pre-migration
-    # rows exactly once, a no-op afterward since the WHERE excludes them.
+    # Backfill: idempotent/cheap to run every time (WHERE excludes rows
+    # already backfilled). Covers both pre-migration rows (no promoted
+    # columns at all) and the original record_id migration.
     spark.sql(f"UPDATE {table} SET record_id = sha2(raw_json, 256) WHERE record_id IS NULL")
+    for name, sql_type, path in config["columns"]:
+        escaped_path = path.replace("'", "''")
+        extract_expr = f"get_json_object(raw_json, '{escaped_path}')"
+        if sql_type == "INT":
+            extract_expr = f"CAST({extract_expr} AS INT)"
+        spark.sql(f"""
+            UPDATE {table} SET {name} = {extract_expr}
+            WHERE {name} IS NULL AND get_json_object(raw_json, '{escaped_path}') IS NOT NULL
+        """)
+    if has_tables_column:
+        spark.sql(f"""
+            UPDATE {table}
+            SET tables = from_json(get_json_object(raw_json, '$.metadata.tables'), 'array<struct<catalog:string,schema:string,table:string>>')
+            WHERE tables IS NULL AND get_json_object(raw_json, '$.metadata.tables') IS NOT NULL
+        """)
+
+    # Sort order -- see module docstring for why this matters for query
+    # pruning. Safe/cheap to set every run; it only affects how FUTURE
+    # writes lay out data, it's not a data-rewriting operation itself.
+    spark.sql(f"ALTER TABLE {table} WRITE ORDERED BY {config['sort_column']}")
 
     try:
         # recursiveFileLookup: fluent-bit's s3 output lands files under
@@ -130,18 +214,39 @@ def main(source: str) -> None:
           .cache()
     )
 
+    # Promoted columns, extracted from raw_json (see module docstring for
+    # why not native nested field access).
+    select_cols = ["record_id", "event_date", "event_time"]
+    df_with_promoted = df
+    for name, sql_type, path in config["columns"]:
+        expr = F.get_json_object(F.col("raw_json"), path)
+        if sql_type == "INT":
+            expr = expr.cast("int")
+        df_with_promoted = df_with_promoted.withColumn(name, expr)
+        select_cols.append(name)
+    if has_tables_column:
+        df_with_promoted = df_with_promoted.withColumn(
+            "tables",
+            F.from_json(F.get_json_object(F.col("raw_json"), "$.metadata.tables"), TABLES_ARRAY_SCHEMA),
+        )
+        select_cols.append("tables")
+    select_cols.append("raw_json")
+
     input_files = sorted(row["_input_file"] for row in df.select("_input_file").distinct().collect())
 
-    out = df.select("record_id", "event_date", "event_time", "raw_json")
+    out = df_with_promoted.select(*select_cols)
     out.createOrReplaceTempView("new_records")
+
+    insert_cols = ", ".join(select_cols)
+    insert_vals = ", ".join(f"s.{c}" for c in select_cols)
 
     try:
         spark.sql(f"""
             MERGE INTO {table} t
             USING new_records s
             ON t.record_id = s.record_id
-            WHEN NOT MATCHED THEN INSERT (record_id, event_date, event_time, raw_json)
-            VALUES (s.record_id, s.event_date, s.event_time, s.raw_json)
+            WHEN NOT MATCHED THEN INSERT ({insert_cols})
+            VALUES ({insert_vals})
         """)
     except Exception:
         # Nothing committed (or partially committed -- Iceberg's MERGE is a

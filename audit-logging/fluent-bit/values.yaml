@@ -92,10 +92,22 @@ config:
         script  /fluent-bit/scripts/strip_k8s_annotations.lua
         call    strip_annotations
 
+    # Matches the JSON key-colon form "repoType": specifically, not a bare
+    # substring match on "repoType" -- found 2026-10-01 while verifying the
+    # Iceberg table redesign: a bare substring match also catches Spark's
+    # OWN internal query-plan debug lines (e.g. this archival job's driver
+    # logging a Catalyst column reference like "repoType#68L" while
+    # processing ranger data), silently miscategorizing them as real
+    # Ranger audit events. Those false positives are real rows in
+    # ranger_audit from before this fix (findable via `WHERE req_user IS
+    # NULL` now that the redesign promotes real columns -- previously
+    # invisible, buried in an opaque raw_json blob) -- left as-is rather
+    # than deleted, same reasoning as the one pre-existing duplicate
+    # documented in ARCHITECTURE.md's "Raw landing retention" section.
     [FILTER]
         Name          rewrite_tag
         Match         kube.*
-        Rule          $log ^.*repoType.*$ audit.ranger.trino true
+        Rule          $log ^.*"repoType":.*$ audit.ranger.trino true
         Emitter_Name  ranger_audit_emitter
 
     # Pulls the trailing JSON audit record back out of Trino's tab-separated

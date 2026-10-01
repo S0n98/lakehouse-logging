@@ -298,6 +298,34 @@ driver's logs show real prior success first (don't delete a run that
 might still be legitimately in-flight), and get confirmation before
 running it if you're not sure.
 
+**A second, different variant of this found 2026-10-01, with no stuck
+child object at all:** the `ScheduledSparkApplication` itself can stop
+firing entirely after an operator restart -- `status.nextRun` frozen
+days in the past, `scheduleState: "Scheduled"` (looks completely
+healthy), and critically **the annotate-to-force-reconcile trick above
+does nothing here** -- the controller logs show it genuinely
+reconciling the object every time (`Reconciling ScheduledSparkApplication
+... state: Scheduled`) but silently decides not to submit, for reasons
+not fully root-caused (the controller's "is a run due" check appears to
+not self-correct once `nextRun` falls far enough behind wall-clock time,
+unlike the single-run wedge above which just needs a nudge). Confirmed:
+the current controller pod's age lines up almost exactly with when the
+schedule stopped advancing, so this is the same underlying
+"operator-restart-at-the-wrong-moment" class of bug, just manifesting in
+the schedule's own bookkeeping instead of one child run's status.
+
+Fix -- delete and recreate the `ScheduledSparkApplication` itself (not
+just a child run), which forces the controller to compute `nextRun`
+fresh from the current time against the cron expression:
+```bash
+kubectl delete scheduledsparkapplication <name> -n default
+kubectl apply -f <same yaml file>
+```
+Safe: this only resets the schedule's own bookkeeping, not any archived
+data -- past `SparkApplication` runs and whatever they already wrote to
+Iceberg are completely unaffected. Check `status.nextRun` afterward is a
+sensible near-future time, not another stale one.
+
 ## This cluster's fluent-bit build has a real bug: avoid the `http` input
 
 `cr.fluentbit.io/fluent/fluent-bit:5.0.9` (and confirmed also `3.1.9`) never

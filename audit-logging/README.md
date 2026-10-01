@@ -345,10 +345,74 @@ dashboard-driven query.
   reconfigured -- its files are legacy, draining on their own 365-day
   locks, untouched by anything now). Change `MIN_AGE_SECONDS_BEFORE_DELETE`
   in `iceberg_archive_job.py` to adjust the 30-day floor.
-- **Cold, queryable (Iceberg)**: never expired by anything in this
-  pipeline. Add a retention job of your own (e.g. an Iceberg `expire
-  snapshots` / delete-old-partitions call) if data needs to age out of the
-  queryable archive eventually.
+- **Cold, queryable (Iceberg)**: data itself is never expired by anything
+  in this pipeline -- add a retention job of your own if it needs to age
+  out eventually. File-level compaction (not data expiration) runs daily
+  via `audit-iceberg-maintenance` -- see "Cold tier maintenance" below.
+
+## Cold tier maintenance
+
+A daily `ScheduledSparkApplication` (`audit-iceberg-maintenance`, 02:30)
+compacts each table's small files (`CALL iceberg.system.
+rewrite_data_files(...)`) -- this pipeline's hourly, low-volume writes
+naturally produce a lot of small files otherwise (see `CAPACITY.md`'s
+file-count-overhead finding).
+
+**Orphan-file cleanup is NOT automated** -- run manually, per table, when
+storage actually warrants it (this cluster's current data volumes don't):
+```sql
+ALTER TABLE iceberg.audit.ranger_audit        EXECUTE remove_orphan_files(retention_threshold => '7d');
+ALTER TABLE iceberg.audit.trino_query_audit   EXECUTE remove_orphan_files(retention_threshold => '7d');
+ALTER TABLE iceberg.audit.superset_audit      EXECUTE remove_orphan_files(retention_threshold => '7d');
+```
+Must be run via **Trino**, not Spark -- Spark's Iceberg integration
+blocks this (a Nessie GC safety guard, also blocks `expire_snapshots`
+entirely, everywhere); Trino's connector doesn't enforce that guard for
+this specific procedure. See `ARCHITECTURE.md`'s "Cold tier maintenance"
+section and `spark/iceberg_maintenance_job.py`'s module docstring for
+the full reasoning -- this is a deliberate scope decision, not a TODO.
+
+## Query cookbook
+
+Common forensic questions, using the promoted columns from the 2026-10-01
+table redesign (see `ARCHITECTURE.md`'s "Table structure" section) --
+plain SQL via Superset SQL Lab or any Trino client, database `Trino`:
+
+**Which queries did user A run on a given date?**
+```sql
+SELECT event_time, query_text, query_state
+FROM iceberg.audit.trino_query_audit
+WHERE event_date = DATE '2026-10-01' AND user_name = 'alice'
+ORDER BY event_time;
+```
+
+**What queries ran on a given date (all users)?**
+```sql
+SELECT event_time, user_name, query_text
+FROM iceberg.audit.trino_query_audit
+WHERE event_date = DATE '2026-10-01'
+ORDER BY event_time;
+```
+
+**When was a specific table queried?** (`tables` is a native array
+column -- plain `UNNEST`, no JSON functions needed)
+```sql
+SELECT a.event_time, a.user_name, t.catalog, t.schema, t."table"
+FROM iceberg.audit.trino_query_audit a
+CROSS JOIN UNNEST(a.tables) AS t(catalog, schema, "table")
+WHERE t."table" = 'nation' AND t.schema = 'tiny';
+```
+(`table` is a reserved word in Trino SQL -- always quote it, both as a
+column name and in the `UNNEST` alias list, as above.)
+
+**Was access to a table granted or denied?** (Ranger's own decision,
+not just "was it queried")
+```sql
+SELECT event_time, req_user, access_type, resource, result  -- 1 = allowed, 0 = denied
+FROM iceberg.audit.ranger_audit
+WHERE resource = 'tpch/tiny/nation'
+ORDER BY event_time DESC;
+```
 
 ## Known gaps / follow-ups
 

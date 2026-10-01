@@ -222,7 +222,43 @@ backdated file, since waiting 30 real days isn't practical to test with):**
 files older than whatever threshold you tested with, and the bucket
 listing confirms they're actually gone afterward.
 
-### 8. install-guide integrity
+### 8. Cold tier schema: promoted columns populated, sort order applied, no duplicates
+
+Verifies the 2026-10-01 table redesign (see `ARCHITECTURE.md`'s "Table
+structure" section).
+
+```sql
+-- schema and sort order
+SHOW CREATE TABLE iceberg.audit.ranger_audit;        -- expect sorted_by = ARRAY['req_user ASC NULLS FIRST']
+SHOW CREATE TABLE iceberg.audit.trino_query_audit;   -- expect tables array(ROW(catalog varchar, schema varchar, "table" varchar))
+
+-- backfill completeness (should shrink to 0, or a small known/explained count -- see below)
+SELECT count(*) FROM iceberg.audit.ranger_audit WHERE req_user IS NULL;
+
+-- idempotency under retries (should always return zero rows)
+SELECT record_id, count(*) FROM iceberg.audit.ranger_audit GROUP BY record_id HAVING count(*) > 1;
+
+-- native array query (no JSON functions needed)
+SELECT a.event_time, t."table"
+FROM iceberg.audit.trino_query_audit a
+CROSS JOIN UNNEST(a.tables) AS t(catalog, schema, "table")
+LIMIT 5;
+```
+
+**Pass:** sort order and nested array type show up in `SHOW CREATE
+TABLE`; the `req_user IS NULL` count is 0 or a small, already-understood
+number (see below, not a sign of broken backfill); the duplicate check
+returns zero rows even immediately after a retried/re-run job; the
+`UNNEST` query runs without error.
+
+**Known, explained non-zero case:** a handful of pre-existing
+`ranger_audit` rows with `req_user IS NULL` are expected on this cluster
+specifically -- real false positives from a since-fixed Ranger
+`rewrite_tag` matching bug (see `ARCHITECTURE.md`), left in place rather
+than deleted. If this count ever *grows* after the fix, that's a real
+regression worth investigating; the pre-existing count itself is not.
+
+### 9. install-guide integrity
 
 ```bash
 for f in ../audit-logging/install-guide/charts/*.tgz; do
