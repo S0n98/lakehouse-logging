@@ -15,6 +15,20 @@ values/    The exact values used for each release. Secrets have been
            before installing.
 ```
 
+**`download-charts.sh` automates (re-)populating both directories** --
+pulls all 6 chart archives at the pinned versions above, and refreshes
+`values/` (copying from this repo's own tracked source for
+opensearch/opensearch-dashboards/fluent-bit, live-dumping spark-operator
+which has no secrets). **It deliberately does NOT touch
+`values/trino-values.yaml` or `values/superset-values.yaml`** -- those
+carry real live secrets when dumped fresh (see "Redacted secrets" below),
+so a live re-dump lands in a separate, gitignored
+`values-live-unredacted/` instead, with instructions printed for manually
+carrying forward real changes while keeping every `<REDACTED-...>`
+placeholder intact. Run it on the box these releases are actually
+deployed on (needs both internet, for the chart repos, and a working
+`kubectl`/`helm` context against this cluster, for the live dumps).
+
 ## What's here and where it came from
 
 | Release | Chart | Namespace | Why it's part of this pipeline |
