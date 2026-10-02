@@ -97,6 +97,112 @@ confirmed merged and the file is 30+ days old, it's deleted -- see
 `ARCHITECTURE.md`'s "Raw landing retention" for the full reasoning
 (including why that wasn't always possible).
 
+## Building the `opensearch-with-s3` image
+
+OpenSearch's install (step 1 below) uses a custom image,
+`opensearch-with-s3:2.19.1`, instead of the stock
+`opensearchproject/opensearch:2.19.1`. It's just that stock image plus one
+extra plugin baked in -- `audit-logging/opensearch/Dockerfile.opensearch-s3`
+is only two lines:
+
+```dockerfile
+FROM opensearchproject/opensearch:2.19.1
+RUN /usr/share/opensearch/bin/opensearch-plugin install --batch repository-s3
+```
+
+**Why `repository-s3`:** it's what lets OpenSearch register an `s3`-type
+snapshot repository, so it can snapshot indices straight into the MinIO
+cold bucket. **Not actually used by the current design** -- cold storage
+went with the Spark/Iceberg archival pipeline described below instead of
+OpenSearch snapshots -- but `values.yaml` already wires the plugin in
+(see its comment at line 24) and nothing has removed it, so the image
+still needs to exist for `helm install` to succeed. Keep this in mind if
+you're ever deciding whether to drop it: it's dead weight for *this*
+design, not a dependency of it.
+
+**There is no registry copy of this image anywhere** -- it's built fresh
+on whichever host runs it and never pushed. Two consequences:
+- If it's ever lost from this cluster (see "Disk pressure" below), it has
+  to be rebuilt from the Dockerfile above, not re-pulled.
+- Building it on a different host (or rebuilding here) requires internet
+  access, since `docker build` both pulls the base image from Docker Hub
+  and has the `opensearch-plugin` installer download `repository-s3` from
+  OpenSearch's plugin repository at build time. There is no offline path
+  for *building* this image -- see `install-guide/README.md`'s "Container
+  images" section: the documented offline strategy is to build it once
+  somewhere with internet, then transfer the built image, not to build it
+  inside an air-gapped network.
+
+### Prerequisites
+
+- The local Docker daemon (`docker build`/`docker save` -- NOT just
+  containerd; see `/root/datahub/CLAUDE.md`'s "Two container runtimes"
+  section if this is unfamiliar).
+- Internet access (pulls the base image + the plugin, as above).
+- Disk headroom. This is a real, recurring constraint on this cluster --
+  check `df -h /` first. At the time of writing this host is at **91%
+  used, ~14G free** on a 146G disk shared by everything (containerd,
+  Docker, every PV). `docker build`/`docker save` of this image is small
+  by this project's standards (a few hundred MB), but on a host this
+  tight it's still worth checking first and running `docker builder prune
+  -f` / `docker image prune -f` beforehand if headroom is thin -- both are
+  safe, only remove dangling/unused layers.
+
+### Build it
+
+```bash
+cd audit-logging/opensearch/
+./build-and-import-image.sh
+```
+
+That script (`audit-logging/opensearch/build-and-import-image.sh`) does
+three things, in order:
+1. `docker build -t opensearch-with-s3:2.19.1 -f Dockerfile.opensearch-s3 .`
+2. `docker save opensearch-with-s3:2.19.1 -o <tmpfile>`
+3. `ctr -a /run/k3s/containerd/containerd.sock -n k8s.io images import <tmpfile>`
+
+Step 3 is the one easy to get wrong by hand: `ctr images import` without
+`-n k8s.io` succeeds silently but imports into containerd's `default`
+namespace, which kubelet's CRI plugin never reads from -- the image would
+still show `ImagePullBackOff` as if it didn't exist. The script already
+gets this right; if you ever do this manually instead, don't drop that
+flag (see `/root/datahub/CLAUDE.md`'s "`ctr images import` needs
+`-n k8s.io`" section).
+
+It prints a confirmation line at the end (`ctr images ls | grep
+opensearch-with-s3`) -- that line appearing is the signal the image is
+actually usable by kubelet, not just sitting in Docker's store.
+
+### Verify
+
+```bash
+# In containerd's k8s.io namespace -- this is the one that matters:
+ctr -a /run/k3s/containerd/containerd.sock -n k8s.io images ls | grep opensearch-with-s3
+
+# Confirm the plugin is actually in the built image (optional sanity check):
+docker run --rm opensearch-with-s3:2.19.1 /usr/share/opensearch/bin/opensearch-plugin list
+# should include: repository-s3
+```
+
+### If it's ever evicted later
+
+Kubelet's image garbage collection can evict this image under disk
+pressure since it's never referenced by any registry -- this has
+happened before on this cluster (see `/root/datahub/CLAUDE.md`'s "Disk
+pressure is a recurring, real risk" section). If `opensearch` pods start
+`ImagePullBackOff`'ing on this image specifically, first check whether
+Docker's separate store still has it (`docker image inspect
+opensearch-with-s3:2.19.1`) -- if so, it's a quick re-import, not a
+rebuild:
+
+```bash
+docker save opensearch-with-s3:2.19.1 -o /tmp/opensearch-with-s3.tar
+ctr -a /run/k3s/containerd/containerd.sock -n k8s.io images import /tmp/opensearch-with-s3.tar
+```
+
+Only re-run `build-and-import-image.sh` from scratch if Docker's copy is
+gone too.
+
 ## Install order
 
 Namespaces/secrets assumed: `logging` (new, for OpenSearch), `monitoring`
@@ -122,11 +228,10 @@ kubectl create secret generic opensearch-admin-password -n monitoring \
   --from-file=OPENSEARCH_ADMIN_PASSWORD=/tmp/ospw
 shred -u /tmp/ospw
 
-# Build the custom image (repository-s3 plugin -- not required by the
-# current design since cold storage no longer uses OpenSearch snapshots,
-# kept in case that changes)
+# Build the custom image -- see "Building the opensearch-with-s3 image"
+# above for the full why/how; needs internet + the local Docker daemon
 cd opensearch/
-./build-and-import-image.sh   # requires the local Docker daemon
+./build-and-import-image.sh
 
 helm install opensearch opensearch/opensearch -n logging -f values.yaml
 kubectl wait --for=condition=ready pod/opensearch-cluster-master-0 -n logging --timeout=180s
