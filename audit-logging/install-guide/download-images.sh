@@ -75,7 +75,14 @@ save_local_only() {
 }
 
 echo "##### A. Audit-logging pipeline's own additions #####"
-pull_and_save "docker.io/library/busybox@sha256:cac8f90bbee42dc962a6b38bb1a235948d070385bb9d996bba15a6db8d364008"
+# Deliberately NOT a pinned digest -- this is the opensearch chart's own
+# unpinned default for its fsgroup-volume init container (nothing in this
+# repo's values.yaml overrides it), so it drifts with upstream. A digest
+# recorded here would just go stale (confirmed: an earlier version of this
+# script pinned a digest that had already drifted by 2026-10-02). Pull
+# "latest" fresh each time you build an offline bundle instead of trusting
+# any digest written down in a doc.
+pull_and_save "docker.io/library/busybox:latest"
 pull_and_save "opensearchproject/opensearch-dashboards:3.8.0"
 pull_and_save "ghcr.io/kubeflow/spark-operator/controller:2.5.2"
 pull_and_save "apache/spark:3.5.3"
@@ -95,7 +102,7 @@ echo "##### B. Pre-existing lakehouse platform #####"
 pull_and_save "trinodb/trino:480"
 pull_and_save "apache/ranger:2.8.0"
 pull_and_save "ghcr.io/projectnessie/nessie:0.107.9"
-pull_and_save "quay.io/minio/operator:v5.0.18"
+pull_and_save "quay.io/minio/operator:v5.0.17"
 pull_and_save "quay.io/minio/minio:RELEASE.2024-08-03T04-33-23Z"
 pull_and_save "docker.io/bitnamilegacy/postgresql:14.17.0-debian-12-r3"
 pull_and_save "docker.io/bitnamilegacy/redis:7.0.10-debian-11-r4"

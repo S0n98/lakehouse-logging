@@ -122,34 +122,32 @@ can query the `iceberg` catalog directly, no extra setup needed.
 
 ### What the tables actually look like
 
-The Spark archival job (`spark/iceberg_archive_job.py`) intentionally
-keeps each row as `event_date` (partition), `event_time`, and a single
-`raw_json` string column holding the *entire* original audit record --
-it doesn't flatten fields into their own columns. Browsing means
-extracting fields from `raw_json` with Trino's JSON functions.
+**Updated 2026-10-01** -- this used to describe an opaque-blob design
+(every field behind `json_extract_scalar(raw_json, ...)`); that was
+redesigned for the long term (see `ARCHITECTURE.md`'s "Table structure:
+promoted columns, not one opaque JSON blob"). Each source now has its own
+real, typed columns -- no JSON functions needed for normal browsing.
+`raw_json` is still kept on every table as a forensic catch-all for
+anything not promoted, so nothing from before is actually lost, it's just
+not the primary way to query anymore.
 
 **Ranger audit** (`iceberg.audit.ranger_audit`):
 ```sql
-SELECT
-  event_time,
-  json_extract_scalar(raw_json, '$.reqUser')  AS req_user,
-  json_extract_scalar(raw_json, '$.access')   AS access,
-  json_extract_scalar(raw_json, '$.resource') AS resource,
-  json_extract_scalar(raw_json, '$.result')   AS result,   -- '1' = allowed, '0' = denied
-  json_extract_scalar(raw_json, '$.reqData')  AS query_text
+SELECT event_time, req_user, access_type, resource, resource_type, repo,
+       result,   -- 1 = allowed, 0 = denied
+       req_data AS query_text
 FROM iceberg.audit.ranger_audit
 ORDER BY event_time DESC
 LIMIT 50;
 ```
 
-**Trino query audit** (`iceberg.audit.trino_query_audit`):
+**Trino query audit** (`iceberg.audit.trino_query_audit`) -- `tables` is a
+native `ARRAY<STRUCT<catalog,schema,table>>` column; `UNNEST` it rather
+than parsing JSON if you need per-table rows (see README.md's "Query
+cookbook" for a worked example):
 ```sql
-SELECT
-  event_time,
-  json_extract_scalar(raw_json, '$.context.user')     AS user,
-  json_extract_scalar(raw_json, '$.metadata.queryId')  AS query_id,
-  json_extract_scalar(raw_json, '$.metadata.query')    AS query_text,
-  json_extract_scalar(raw_json, '$.metadata.queryState') AS query_state
+SELECT event_time, user_name, source, remote_address,
+       query_id, query_state, query_text
 FROM iceberg.audit.trino_query_audit
 ORDER BY event_time DESC
 LIMIT 50;
@@ -157,19 +155,16 @@ LIMIT 50;
 
 **Superset action audit** (`iceberg.audit.superset_audit`):
 ```sql
-SELECT
-  event_time,
-  json_extract_scalar(raw_json, '$.action')        AS action,
-  json_extract_scalar(raw_json, '$.user_id')       AS user_id,
-  json_extract_scalar(raw_json, '$.dashboard_id')  AS dashboard_id,
-  json_extract_scalar(raw_json, '$.duration_ms')   AS duration_ms
+SELECT event_time, user_id, action, dashboard_id, slice_id, duration_ms
 FROM iceberg.audit.superset_audit
 ORDER BY event_time DESC
 LIMIT 50;
 ```
 
 Save any of these as a SQL Lab query (or a dataset, then a dashboard) if
-you want a persistent view rather than re-running it each time.
+you want a persistent view rather than re-running it each time. See
+README.md's "Query cookbook" for task-oriented queries (by user, by
+date, by table, Ranger allow/deny) built on this same schema.
 
 ### Bonus: Trino's own web UI for query monitoring
 

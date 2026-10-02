@@ -53,7 +53,7 @@ separately budgeted here.
 | `trino-audit-shim` | 10m | 100m | 32Mi | 64Mi | negligible |
 | Spark driver (per run, ×3 sources) | 1 core | — | 1Gi | — | ~1.5-2 min runtime |
 | Spark executor (per run, ×3 sources, 1 each) | 1 core | — | 1Gi | — | same window as driver |
-| OpenSearch Dashboards (optional, **not installed**) | 250m | 1 core | 512Mi | 1Gi | n/a |
+| OpenSearch Dashboards (optional, **installed 2026-09-29**) | 250m | 1 core | 512Mi | 1Gi | 4m CPU, 268Mi RAM (2026-10-02) |
 
 Two things worth calling out:
 

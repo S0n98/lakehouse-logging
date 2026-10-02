@@ -367,9 +367,11 @@ SELECT * FROM iceberg.audit.ranger_audit ORDER BY event_time DESC LIMIT 20;
 SELECT * FROM iceberg.audit.trino_query_audit ORDER BY event_time DESC LIMIT 20;
 SELECT * FROM iceberg.audit.superset_audit ORDER BY event_time DESC LIMIT 20;
 
--- full audit payload is in raw_json; pull specific fields out with Trino's
--- JSON functions, e.g.:
-SELECT event_time, json_extract_scalar(raw_json, '$.user') AS user
+-- promoted columns are queryable directly, no JSON functions needed --
+-- see "Query cookbook" below for more, and ARCHITECTURE.md's "Table
+-- structure" section for why (raw_json is still there as a forensic
+-- catch-all, just not the normal way to query anymore):
+SELECT event_time, user_name, query_text
 FROM iceberg.audit.trino_query_audit
 WHERE event_date = current_date;
 ```
@@ -541,3 +543,31 @@ ORDER BY event_time DESC;
 - See `/root/datahub/CLAUDE.md` for cluster-level operational gotchas
   (disk space, node IP, the fluent-bit bug in more detail, image registry
   quirks, spark-operator recovery) uncovered while building this.
+- **`opensearch-with-s3` is a candidate for simplification, not a hard
+  requirement.** The `repository-s3` plugin it adds over stock
+  `opensearchproject/opensearch` is unused by the current design (see
+  "Building the `opensearch-with-s3` image" above) -- the image is only
+  still required because `opensearch/values.yaml` names it. Switching
+  that `image:` block back to the stock upstream image and retiring the
+  custom build/`Dockerfile.opensearch-s3`/`build-and-import-image.sh`
+  would remove one of this cluster's recurring disk-pressure-eviction
+  pain points (it's local-only, never in a registry, so GC'ing it means
+  a manual re-import every time -- happened again 2026-10-02, 14 hours of
+  hot-tier downtime before anyone noticed) for zero functional loss.
+  Deliberately not done as part of this pass since it's a real config
+  change to a running release, not a docs fix -- worth doing deliberately
+  if/when you're ready, not as a drive-by.
+- `install-guide/values/trino-values.yaml` and `superset-values.yaml` are
+  now stale against the live cluster (confirmed via `helm get values`,
+  2026-10-02) -- live Trino has a fix (the
+  `xasecure.audit.log4j.async.max.flush.interval.ms` property from "Bugs
+  found and fixed during rollout" below) that the tracked file is missing
+  entirely, and live Superset's LDAP group mapping has moved on from what
+  the tracked file shows. Refreshing them requires dumping real
+  credentials (LDAP bind password, Trino's shared secret, bcrypt hashes,
+  MinIO keys, Superset's secret key, Postgres passwords) to do the diff,
+  which is deliberately not something this pass did automatically -- see
+  `install-guide/download-charts.sh`'s `dump_values_unredacted` path
+  (writes to a gitignored `values-live-unredacted/`, never over the
+  tracked files) and redact by hand per "Redacted secrets" in
+  `install-guide/README.md` before replacing the tracked copies.

@@ -115,11 +115,14 @@ crash/error, check `kubectl get deploy,statefulset -A -o
 custom-columns=NS:.metadata.namespace,NAME:.metadata.name,DESIRED:.spec.replicas
 | grep ' 0$'` before assuming it's actually broken.
 
-The cluster is also littered with ~250 leftover `ContainerStatusUnknown` /
+The cluster is also littered with leftover `ContainerStatusUnknown` /
 `Init:ContainerStatusUnknown` / `Error` pod records from whenever this
 outage happened (stale API objects, not real running containers — they
 don't hold real resource allocations). Harmless but noisy; nobody's
-cleaned them up. `kubectl delete pod --field-selector=status.phase=Failed
+cleaned them up -- **~250 originally, down to ~143 as of 2026-10-02**
+(some amount of natural attrition over time, not anyone's deliberate
+cleanup -- re-check the live count rather than trust either number if
+this matters to you). `kubectl delete pod --field-selector=status.phase=Failed
 -A` (or similar, per-namespace) would tidy them up if asked, but that's a
 few hundred deletes across namespaces this session didn't own — do it
 deliberately, not as a drive-by.
@@ -189,6 +192,15 @@ happens:
   those start `ImagePullBackOff`'ing right after a disk-pressure episode,
   that's why -- re-import them from the separate Docker daemon's store
   (see below), they're not actually gone, just evicted from containerd.
+  **This can go unnoticed for a long time if nobody's actively watching
+  the pod** -- found 2026-10-02 with `opensearch-cluster-master-0` stuck
+  `Init:ImagePullBackOff` on `opensearch-with-s3:2.19.1` for **14 hours**
+  (hot-tier logging fully down that whole time), discovered only during an
+  unrelated documentation audit, not through any alert. Recovery was the
+  same as always (Docker's store still had it) -- the gap isn't the fix,
+  it's that nothing in this cluster notices when a pod silently wedges in
+  `ImagePullBackOff`. Worth a real liveness/alerting story if this pipeline
+  ever needs to actually be relied on, not just manually checked on.
 
 `df -h /` before anything disk-heavy (image builds/pulls, Spark jobs
 downloading dependency jars). Safe, non-destructive relief valves that
