@@ -19,12 +19,15 @@ singleNode: true
 replicas: 1
 
 image:
-  # Custom image = opensearchproject/opensearch:2.19.1 + the repository-s3
-  # plugin (needed to snapshot indices straight to the MinIO cold bucket).
-  # Built from Dockerfile.opensearch-s3 via build-and-import-image.sh,
-  # and imported directly into this node's containerd k8s.io namespace --
-  # not pushed to any registry, so imagePullPolicy must stay IfNotPresent.
-  repository: opensearch-with-s3
+  # Stock image -- simplified 2026-10-02 from a custom build that added the
+  # repository-s3 plugin (for snapshotting indices to MinIO). That feature
+  # was never actually used by this pipeline's design (cold storage went
+  # with the Spark/Iceberg archival pipeline instead, see ARCHITECTURE.md),
+  # and the custom image was a recurring disk-pressure-eviction pain point
+  # (local-only, never in a registry -- see CLAUDE.md) for a dormant
+  # feature. If snapshot-based cold storage is ever revisited, see git
+  # history before this commit for the custom image's Dockerfile.
+  repository: opensearchproject/opensearch
   tag: "2.19.1"
   pullPolicy: IfNotPresent
 
@@ -53,14 +56,6 @@ persistence:
   storageClass: nfs-client
   size: 100Gi
 
-# Seeds the S3 client credentials into the OpenSearch keystore at startup,
-# using the chart's native keystore mechanism: each key in the referenced
-# secret becomes a keystore entry of the same name.
-# Secret created by: kubectl create secret generic minio-s3-keystore-creds ...
-# (see ../README section "OpenSearch <-> MinIO snapshot repo").
-keystore:
-  - secretName: minio-s3-keystore-creds
-
 config:
   # Deliberately do NOT set any plugins.security.ssl.* paths here: leaving
   # them unset is what lets the image's own entrypoint
@@ -76,11 +71,6 @@ config:
     cluster.name: opensearch-cluster
     network.host: 0.0.0.0
     discovery.type: single-node
-
-    s3.client.default.endpoint: myminio-hl.default.svc.cluster.local:9000
-    s3.client.default.protocol: http
-    s3.client.default.path_style_access: true
-    s3.client.default.region: us-east-1
 
 service:
   type: ClusterIP

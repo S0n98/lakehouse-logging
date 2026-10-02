@@ -188,19 +188,24 @@ happens:
   manual intervention needed for the taint itself).
 - Kubelet's image garbage collection may evict container images to free
   space -- including custom, never-pushed-anywhere images like
-  `opensearch-with-s3:2.19.1` and `superset-ldap:6.0.0`. If pods relying on
-  those start `ImagePullBackOff`'ing right after a disk-pressure episode,
-  that's why -- re-import them from the separate Docker daemon's store
-  (see below), they're not actually gone, just evicted from containerd.
+  `superset-ldap:6.0.0`. If pods relying on one of those start
+  `ImagePullBackOff`'ing right after a disk-pressure episode, that's why --
+  re-import it from the separate Docker daemon's store (see below), it's
+  not actually gone, just evicted from containerd.
   **This can go unnoticed for a long time if nobody's actively watching
   the pod** -- found 2026-10-02 with `opensearch-cluster-master-0` stuck
-  `Init:ImagePullBackOff` on `opensearch-with-s3:2.19.1` for **14 hours**
-  (hot-tier logging fully down that whole time), discovered only during an
-  unrelated documentation audit, not through any alert. Recovery was the
-  same as always (Docker's store still had it) -- the gap isn't the fix,
-  it's that nothing in this cluster notices when a pod silently wedges in
-  `ImagePullBackOff`. Worth a real liveness/alerting story if this pipeline
-  ever needs to actually be relied on, not just manually checked on.
+  `Init:ImagePullBackOff` on the then-custom `opensearch-with-s3:2.19.1`
+  image for **14 hours** (hot-tier logging fully down that whole time),
+  discovered only during an unrelated documentation audit, not through any
+  alert. Recovery was the same as always (Docker's store still had it) --
+  the gap isn't the fix, it's that nothing in this cluster notices when a
+  pod silently wedges in `ImagePullBackOff`. That specific image is now
+  retired (OpenSearch switched to the stock image 2026-10-02, see
+  `audit-logging/README.md`'s "History" note, removing it as an eviction
+  risk) but the underlying gap -- no liveness/alerting story for any other
+  custom image evicted the same way -- still applies to `superset-ldap`
+  and is worth fixing if this pipeline ever needs to actually be relied
+  on, not just manually checked on.
 
 `df -h /` before anything disk-heavy (image builds/pulls, Spark jobs
 downloading dependency jars). Safe, non-destructive relief valves that

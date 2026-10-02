@@ -169,11 +169,14 @@ adds the pieces that aren't pure audit-record data.
   (`spark-history-server`'s chart already does this — same pattern, see
   `install-guide/README.md`'s offline-install section), trading a one-time
   image size cost for eliminating ~7.9TB/year of repeated download.
-- **Custom container images.** `opensearch-with-s3` and `superset-ldap`
-  (~1.17GB per `docker images` — see `CLAUDE.md`'s recurring eviction
-  gotcha) — fixed, one-time, not growing with time, but real disk that
-  has to exist on this host and gets **evicted under disk pressure and
-  needs re-importing**, which happened twice during this project already.
+- **Custom container images.** `superset-ldap` (~1.17GB per
+  `docker images` — see `CLAUDE.md`'s recurring eviction gotcha) — fixed,
+  one-time, not growing with time, but real disk that has to exist on
+  this host and gets **evicted under disk pressure and needs
+  re-importing**, which has happened multiple times during this project.
+  (`opensearch-with-s3` used to be in this same boat -- retired
+  2026-10-02, OpenSearch now runs the stock upstream image instead, see
+  `audit-logging/README.md`'s "History" note -- one fewer eviction risk.)
 
 ### Combined 1-year disk estimate, by scenario
 

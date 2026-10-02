@@ -131,10 +131,11 @@ install, which is easy to miss if you only check the Helm charts.
 (as `.tar` files, ready to transfer) -- run it on a machine with internet
 access, then transfer its output directory and `ctr ... images import`
 each file on the air-gapped cluster (exact command in the script's own
-header). It can't fetch the two custom, local-only images for you
-(`opensearch-with-s3`, `superset-ldap`) -- it saves them if they already
-exist in this host's Docker store, and tells you clearly if not, per the
-table below.
+header). It can't fetch the one remaining custom, local-only image for you
+(`superset-ldap` -- `opensearch-with-s3` was retired 2026-10-02, OpenSearch
+now runs the stock image, see `../README.md`'s "History" note) -- it saves
+it if it already exists in this host's Docker store, and tells you
+clearly if not, per the table below.
 
 **Every image below is needed for the full working system, not just the
 audit-logging additions** -- the audit pipeline doesn't run standalone,
@@ -157,13 +158,13 @@ exact commands and the `-n k8s.io` namespace gotcha).
 
 | Image | Public? | Notes |
 |---|---|---|
-| `opensearch-with-s3:2.19.1` | **No -- custom, local-only** | Built from `../opensearch/Dockerfile.opensearch-s3`. Building it requires internet (downloads the `repository-s3` plugin). For offline use: build it once where there IS internet, then transfer the built image (`docker save` / `ctr export`) -- do not try to build the Dockerfile inside the air-gapped network. |
+| `opensearchproject/opensearch:2.19.1` | Yes | OpenSearch itself. Stock upstream image -- the custom `opensearch-with-s3` build (stock + the unused `repository-s3` plugin) was retired 2026-10-02; see `../README.md`'s "History" note. |
 | `docker.io/library/busybox:latest` | Yes | OpenSearch init container (`fsgroup-volume`) -- the chart's own unpinned default, nothing in this repo's `values.yaml` overrides it. **Genuinely floating, not pinned**: an earlier version of this table recorded a specific digest as "the exact digest actually running" (captured 2026-09-29), and by 2026-10-02 that digest had already silently drifted to a different one on this same cluster, with no action taken by anyone -- confirmed via `docker image inspect`/`ctr images ls`. Don't trust any digest written in a doc for this one; re-pull `latest` and re-resolve the digest at the time you actually build an offline bundle, or add an explicit `image:`/digest override in `opensearch/values.yaml` if you want this to stop drifting for real. |
 | `opensearchproject/opensearch-dashboards:3.8.0` | Yes | Now actually installed on this cluster (2026-09-29) -- see the ingress/cluster-block gotchas above before assuming a clean install elsewhere. |
 | `ghcr.io/kubeflow/spark-operator/controller:2.5.2` | Yes | Used for both the spark-operator controller and webhook deployments. |
 | `apache/spark:3.5.3` | Yes | Driver/executor image for the archival jobs (`../spark/`). |
 | `cr.fluentbit.io/fluent/fluent-bit:5.0.9` | Yes | |
-| `quay.io/minio/mc:latest` | Yes, **but flaky** | Used by the one-shot bucket-setup jobs (`../minio/create-audit-raw-bucket-job.yaml`, and the legacy `create-audit-bucket-job.yaml`). `docker.io/minio/mc` requires auth for anonymous pulls (`insufficient_scope`); `quay.io/minio/mc:latest` has also returned HTTP 401 intermittently during this project (rate-limiting, apparently) -- if either fails, create the bucket directly with any S3 SDK instead (`boto3.client("s3").create_bucket(...)`, no image needed at all). Pin an exact tag if you rely on the image, not `latest`. |
+| `quay.io/minio/mc:latest` | Yes, **but flaky** | Used by the one-shot bucket-setup job (`../minio/create-audit-raw-bucket-job.yaml`). `docker.io/minio/mc` requires auth for anonymous pulls (`insufficient_scope`); `quay.io/minio/mc:latest` has also returned HTTP 401 intermittently during this project (rate-limiting, apparently) -- if either fails, create the bucket directly with any S3 SDK instead (`boto3.client("s3").create_bucket(...)`, no image needed at all). Pin an exact tag if you rely on the image, not `latest`. |
 | `python:3.12-alpine` | Yes | `trino-audit-shim` (`../trino/audit-shim.yaml`). |
 
 **B. Pre-existing lakehouse platform** (this pipeline depends on these
@@ -219,7 +220,8 @@ While you still have internet access, download the four jars above (plus
 their transitive dependency, `org.wildfly.openssl:wildfly-openssl:1.0.7.Final`
 -- pulled in automatically by `hadoop-aws`) from Maven Central, `COPY`
 them into `/opt/spark/jars/` in a Dockerfile `FROM apache/spark:3.5.3`,
-build and transfer that image the same way as `opensearch-with-s3`, and:
+build and transfer that image the same way as `superset-ldap` (see "1.
+Container images" above), and:
 - point `image:` at the new custom image instead of `apache/spark:3.5.3`
   in all three `scheduled-spark-application.yaml` templates,
 - delete the `deps.packages` block entirely (the jars are already on the
@@ -247,7 +249,4 @@ archive" for the one-off-run pattern) and confirm it reaches
 
 Once the images and jars above are handled, the rest of the pipeline only
 talks to other services already inside the same cluster (OpenSearch,
-MinIO, Nessie, Trino, Fluent Bit) -- no other internet dependency. The
-`opensearch-with-s3` image's `repository-s3` plugin, in particular, is
-already installed into the image at build time (step 1 above); it does
-**not** reach out to the internet again at container startup.
+MinIO, Nessie, Trino, Fluent Bit) -- no other internet dependency.

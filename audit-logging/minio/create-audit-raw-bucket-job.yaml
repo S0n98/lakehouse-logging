@@ -1,7 +1,9 @@
 # One-shot Job that provisions the raw-JSON-landing bucket, `audit-logs-raw`.
 #
-# Deliberately created WITHOUT Object Lock -- unlike `create-audit-bucket-job.yaml`
-# (now legacy, see its header), this bucket's raw files are meant to be
+# Deliberately created WITHOUT Object Lock -- unlike this bucket's
+# predecessor (the old `audit-logs-cold` bucket's provisioning job, removed
+# from this repo -- see ../ARCHITECTURE.md's "Raw landing retention" for
+# why), this bucket's raw files are meant to be
 # deleted by the Spark archival job once confirmed merged into Iceberg AND
 # at least 30 days old (see ../spark/iceberg_archive_job.py). Object Lock
 # would block that entirely (GOVERNANCE-mode retention rejects plain

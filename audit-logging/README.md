@@ -45,16 +45,17 @@ during rollout" (#4) for the full writeup.
 ## What's here
 
 ```
-opensearch/    Hot tier: OpenSearch + the custom image with repository-s3
-               (kept for possible future use), ISM policy setup job.
+opensearch/    Hot tier: OpenSearch (stock image), ISM policy setup job.
 fluent-bit/    The collector: routes Ranger/Trino/Superset audit lines to
                both OpenSearch (hot) and MinIO raw landing (cold source).
                Read the header comment in values.yaml before touching this
                file -- there's a real fluent-bit bug its design works around.
 minio/         The audit-logs-raw bucket (no Object Lock; retention is
                app-managed by the Spark job, see below) -- raw JSON
-               landing zone, the input to the Spark->Iceberg load. Also
-               has the legacy, Object-Lock'd create-audit-bucket-job.yaml.
+               landing zone, the input to the Spark->Iceberg load. The
+               old, Object-Lock'd bucket this replaced is gone from this
+               repo now (nothing reads/writes it going forward -- its
+               history is in ARCHITECTURE.md's "Raw landing retention").
 spark/         The periodic Spark job that loads raw JSON into Iceberg
                tables under the `lakehouse` warehouse. This is the actual
                cold, queryable archive.
@@ -97,111 +98,26 @@ confirmed merged and the file is 30+ days old, it's deleted -- see
 `ARCHITECTURE.md`'s "Raw landing retention" for the full reasoning
 (including why that wasn't always possible).
 
-## Building the `opensearch-with-s3` image
+## History: the `opensearch-with-s3` custom image is gone (removed 2026-10-02)
 
-OpenSearch's install (step 1 below) uses a custom image,
-`opensearch-with-s3:2.19.1`, instead of the stock
-`opensearchproject/opensearch:2.19.1`. It's just that stock image plus one
-extra plugin baked in -- `audit-logging/opensearch/Dockerfile.opensearch-s3`
-is only two lines:
+OpenSearch used to run a custom image (stock
+`opensearchproject/opensearch:2.19.1` + the `repository-s3` plugin, for
+snapshotting indices straight to a MinIO bucket) instead of the plain
+upstream image. **That feature was never actually used by this pipeline's
+design** -- cold storage went with the Spark/Iceberg archival pipeline
+described below instead of OpenSearch snapshots -- and the custom image
+was a recurring disk-pressure-eviction pain point (local-only, never in
+any registry, so kubelet GC'ing it meant a manual re-import every time;
+one such eviction went unnoticed for 14 hours before anyone caught it).
 
-```dockerfile
-FROM opensearchproject/opensearch:2.19.1
-RUN /usr/share/opensearch/bin/opensearch-plugin install --batch repository-s3
-```
-
-**Why `repository-s3`:** it's what lets OpenSearch register an `s3`-type
-snapshot repository, so it can snapshot indices straight into the MinIO
-cold bucket. **Not actually used by the current design** -- cold storage
-went with the Spark/Iceberg archival pipeline described below instead of
-OpenSearch snapshots -- but `values.yaml` already wires the plugin in
-(see its comment at line 24) and nothing has removed it, so the image
-still needs to exist for `helm install` to succeed. Keep this in mind if
-you're ever deciding whether to drop it: it's dead weight for *this*
-design, not a dependency of it.
-
-**There is no registry copy of this image anywhere** -- it's built fresh
-on whichever host runs it and never pushed. Two consequences:
-- If it's ever lost from this cluster (see "Disk pressure" below), it has
-  to be rebuilt from the Dockerfile above, not re-pulled.
-- Building it on a different host (or rebuilding here) requires internet
-  access, since `docker build` both pulls the base image from Docker Hub
-  and has the `opensearch-plugin` installer download `repository-s3` from
-  OpenSearch's plugin repository at build time. There is no offline path
-  for *building* this image -- see `install-guide/README.md`'s "Container
-  images" section: the documented offline strategy is to build it once
-  somewhere with internet, then transfer the built image, not to build it
-  inside an air-gapped network.
-
-### Prerequisites
-
-- The local Docker daemon (`docker build`/`docker save` -- NOT just
-  containerd; see `/root/datahub/CLAUDE.md`'s "Two container runtimes"
-  section if this is unfamiliar).
-- Internet access (pulls the base image + the plugin, as above).
-- Disk headroom. This is a real, recurring constraint on this cluster --
-  check `df -h /` first. At the time of writing this host is at **91%
-  used, ~14G free** on a 146G disk shared by everything (containerd,
-  Docker, every PV). `docker build`/`docker save` of this image is small
-  by this project's standards (a few hundred MB), but on a host this
-  tight it's still worth checking first and running `docker builder prune
-  -f` / `docker image prune -f` beforehand if headroom is thin -- both are
-  safe, only remove dangling/unused layers.
-
-### Build it
-
-```bash
-cd audit-logging/opensearch/
-./build-and-import-image.sh
-```
-
-That script (`audit-logging/opensearch/build-and-import-image.sh`) does
-three things, in order:
-1. `docker build -t opensearch-with-s3:2.19.1 -f Dockerfile.opensearch-s3 .`
-2. `docker save opensearch-with-s3:2.19.1 -o <tmpfile>`
-3. `ctr -a /run/k3s/containerd/containerd.sock -n k8s.io images import <tmpfile>`
-
-Step 3 is the one easy to get wrong by hand: `ctr images import` without
-`-n k8s.io` succeeds silently but imports into containerd's `default`
-namespace, which kubelet's CRI plugin never reads from -- the image would
-still show `ImagePullBackOff` as if it didn't exist. The script already
-gets this right; if you ever do this manually instead, don't drop that
-flag (see `/root/datahub/CLAUDE.md`'s "`ctr images import` needs
-`-n k8s.io`" section).
-
-It prints a confirmation line at the end (`ctr images ls | grep
-opensearch-with-s3`) -- that line appearing is the signal the image is
-actually usable by kubelet, not just sitting in Docker's store.
-
-### Verify
-
-```bash
-# In containerd's k8s.io namespace -- this is the one that matters:
-ctr -a /run/k3s/containerd/containerd.sock -n k8s.io images ls | grep opensearch-with-s3
-
-# Confirm the plugin is actually in the built image (optional sanity check):
-docker run --rm opensearch-with-s3:2.19.1 /usr/share/opensearch/bin/opensearch-plugin list
-# should include: repository-s3
-```
-
-### If it's ever evicted later
-
-Kubelet's image garbage collection can evict this image under disk
-pressure since it's never referenced by any registry -- this has
-happened before on this cluster (see `/root/datahub/CLAUDE.md`'s "Disk
-pressure is a recurring, real risk" section). If `opensearch` pods start
-`ImagePullBackOff`'ing on this image specifically, first check whether
-Docker's separate store still has it (`docker image inspect
-opensearch-with-s3:2.19.1`) -- if so, it's a quick re-import, not a
-rebuild:
-
-```bash
-docker save opensearch-with-s3:2.19.1 -o /tmp/opensearch-with-s3.tar
-ctr -a /run/k3s/containerd/containerd.sock -n k8s.io images import /tmp/opensearch-with-s3.tar
-```
-
-Only re-run `build-and-import-image.sh` from scratch if Docker's copy is
-gone too.
+Removed for real: `opensearch/values.yaml` now points at the stock image,
+the now-pointless `keystore`/`s3.client.default.*` config was dropped
+alongside it, the orphaned `minio-s3-keystore-creds` secret was deleted,
+and `Dockerfile.opensearch-s3`/`build-and-import-image.sh` no longer exist
+in this repo (see git history before this commit if snapshot-based cold
+storage is ever revisited). Live-verified: `helm upgrade`d the running
+release, rollout completed clean, `opensearch-cluster-master-0` running
+`opensearchproject/opensearch:2.19.1` with no `keystore` init container.
 
 ## Install order
 
@@ -228,17 +144,12 @@ kubectl create secret generic opensearch-admin-password -n monitoring \
   --from-file=OPENSEARCH_ADMIN_PASSWORD=/tmp/ospw
 shred -u /tmp/ospw
 
-# Build the custom image -- see "Building the opensearch-with-s3 image"
-# above for the full why/how; needs internet + the local Docker daemon
-cd opensearch/
-./build-and-import-image.sh
-
-helm install opensearch opensearch/opensearch -n logging -f values.yaml
+helm install opensearch opensearch/opensearch -n logging -f opensearch/values.yaml
 kubectl wait --for=condition=ready pod/opensearch-cluster-master-0 -n logging --timeout=180s
 
 # Optional: dashboards UI
 helm install opensearch-dashboards opensearch/opensearch-dashboards \
-  -n logging -f dashboards-values.yaml
+  -n logging -f opensearch/dashboards-values.yaml
 ```
 
 ### 2. MinIO raw landing bucket
@@ -248,9 +159,10 @@ kubectl apply -f minio/create-audit-raw-bucket-job.yaml
 kubectl logs -n default job/create-audit-raw-bucket   # confirm success
 ```
 
-(`minio/create-audit-bucket-job.yaml`, provisioning the old `audit-logs-cold`
-bucket with Object Lock, is legacy -- do not apply it for a new install.
-See `ARCHITECTURE.md`'s "Raw landing retention" section for why.)
+(The old `audit-logs-cold` bucket's provisioning job, Object-Lock'd and
+superseded by the above, has been removed from this repo -- see
+`ARCHITECTURE.md`'s "Raw landing retention" section for why it existed
+and why it's gone.)
 
 ### 3. ISM policies (needs step 1 done first)
 
@@ -543,20 +455,6 @@ ORDER BY event_time DESC;
 - See `/root/datahub/CLAUDE.md` for cluster-level operational gotchas
   (disk space, node IP, the fluent-bit bug in more detail, image registry
   quirks, spark-operator recovery) uncovered while building this.
-- **`opensearch-with-s3` is a candidate for simplification, not a hard
-  requirement.** The `repository-s3` plugin it adds over stock
-  `opensearchproject/opensearch` is unused by the current design (see
-  "Building the `opensearch-with-s3` image" above) -- the image is only
-  still required because `opensearch/values.yaml` names it. Switching
-  that `image:` block back to the stock upstream image and retiring the
-  custom build/`Dockerfile.opensearch-s3`/`build-and-import-image.sh`
-  would remove one of this cluster's recurring disk-pressure-eviction
-  pain points (it's local-only, never in a registry, so GC'ing it means
-  a manual re-import every time -- happened again 2026-10-02, 14 hours of
-  hot-tier downtime before anyone noticed) for zero functional loss.
-  Deliberately not done as part of this pass since it's a real config
-  change to a running release, not a docs fix -- worth doing deliberately
-  if/when you're ready, not as a drive-by.
 - `install-guide/values/trino-values.yaml` and `superset-values.yaml` are
   now stale against the live cluster (confirmed via `helm get values`,
   2026-10-02) -- live Trino has a fix (the

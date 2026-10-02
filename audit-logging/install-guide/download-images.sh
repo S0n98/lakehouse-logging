@@ -2,7 +2,7 @@
 # Pulls and saves (as .tar files) every container image this stack needs,
 # for transferring into an air-gapped environment -- see
 # "Installing in an offline / air-gapped environment" in this directory's
-# README.md for the full reasoning behind this list and the two images
+# README.md for the full reasoning behind this list and the one image
 # this script CANNOT fetch for you.
 #
 # Usage:
@@ -51,9 +51,8 @@ pull_and_save() {
 
 # Save-only: for images that can't be pulled from any registry at all --
 # custom, local-only builds. Requires the image to already exist in this
-# host's Docker store (built via ../opensearch/build-and-import-image.sh
-# for opensearch-with-s3, or whatever originally produced superset-ldap --
-# see this directory's README.md, "Container images" table, for both).
+# host's Docker store (whatever originally produced superset-ldap -- see
+# this directory's README.md, "Container images" table).
 save_local_only() {
   local image="$1"
   local fname
@@ -83,6 +82,7 @@ echo "##### A. Audit-logging pipeline's own additions #####"
 # "latest" fresh each time you build an offline bundle instead of trusting
 # any digest written down in a doc.
 pull_and_save "docker.io/library/busybox:latest"
+pull_and_save "opensearchproject/opensearch:2.19.1"
 pull_and_save "opensearchproject/opensearch-dashboards:3.8.0"
 pull_and_save "ghcr.io/kubeflow/spark-operator/controller:2.5.2"
 pull_and_save "apache/spark:3.5.3"
@@ -95,7 +95,6 @@ pull_and_save "python:3.12-alpine"
 # image entirely and create buckets directly with any S3 SDK instead
 # (e.g. boto3's create_bucket -- no image needed at all).
 pull_and_save "quay.io/minio/mc:latest"
-save_local_only "opensearch-with-s3:2.19.1"
 
 echo
 echo "##### B. Pre-existing lakehouse platform #####"
