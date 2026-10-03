@@ -121,6 +121,11 @@ release, rollout completed clean, `opensearch-cluster-master-0` running
 
 ## Install order
 
+**See `INSTALL.md` for the fully detailed version of this same sequence**
+-- every secret created (exact name/namespace/keys/why), a verification
+command after each step, and a consolidated secrets reference table.
+What follows here is the condensed, command-only version.
+
 Namespaces/secrets assumed: `logging` (new, for OpenSearch), `monitoring`
 (existing, has Loki + fluent-bit), `default` (existing, has MinIO/Trino/
 Superset/Nessie/spark-operator), `ranger` (existing).
@@ -261,13 +266,17 @@ for the recovery steps used the first time).
 ```bash
 kubectl create configmap audit-archive-script -n default \
   --from-file=iceberg_archive_job.py=spark/iceberg_archive_job.py
+kubectl create configmap audit-maintenance-script -n default \
+  --from-file=iceberg_maintenance_job.py=spark/iceberg_maintenance_job.py
 kubectl apply -f spark/scheduled-spark-application.yaml
 kubectl get scheduledsparkapplication -n default
 ```
 
-Runs hourly (5/10/15 minutes past, one source each, staggered so
-fluent-bit's upload buffer has flushed and so the three don't compete for
-the node's resources at the same instant).
+Four `ScheduledSparkApplication` resources total: one hourly per source
+(5/10/15 minutes past, staggered so fluent-bit's upload buffer has
+flushed and so the three don't compete for the node's resources at the
+same instant), plus one daily compaction job (`30 2 * * *`) -- see
+`ARCHITECTURE.md`'s "Cold tier maintenance" section.
 
 ## Querying the cold archive
 
